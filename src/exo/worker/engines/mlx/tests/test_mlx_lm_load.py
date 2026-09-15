@@ -133,7 +133,9 @@ def test_qwen38_eos_token_ids(model_id: str) -> None:
 def test_qwen3_and_llama_eos_paths_unchanged() -> None:
     assert get_eos_token_ids_for_model(ModelId("mlx-community/Qwen3-0.6B-4bit")) is None
     assert (
-        get_eos_token_ids_for_model(ModelId("mlx-community/llama-3.3-70b-instruct-fp16"))
+        get_eos_token_ids_for_model(
+            ModelId("mlx-community/llama-3.3-70b-instruct-fp16")
+        )
         is None
     )
     assert get_eos_token_ids_for_model(ModelId("mlx-community/Qwen3.5-27B-4bit")) == [
