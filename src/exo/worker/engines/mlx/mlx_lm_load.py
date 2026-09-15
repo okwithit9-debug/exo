@@ -16,8 +16,9 @@ is not wired into EXO's mlx_lm disaggregation path.
 
 from __future__ import annotations
 
+import importlib
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -49,13 +50,17 @@ def is_qwen4_exp_config(config: Mapping[str, object]) -> bool:
     """Return True when a HuggingFace / MLX config.json is Flash-Next."""
     model_type = config.get("model_type")
     text_config = config.get("text_config")
-    text_model_type: object = None
-    if isinstance(text_config, Mapping):
-        text_model_type = text_config.get("model_type")
+    text_model_type: str | None = None
+    if isinstance(text_config, dict):
+        raw_text_model_type = text_config.get("model_type")  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+        if isinstance(raw_text_model_type, str):
+            text_model_type = raw_text_model_type
     architectures = config.get("architectures")
-    architecture_names: list[str] = (
-        [str(name) for name in architectures] if isinstance(architectures, list) else []
-    )
+    architecture_names: list[str] = []
+    if isinstance(architectures, list):
+        for name in architectures:  # pyright: ignore[reportUnknownVariableType]
+            if isinstance(name, str):
+                architecture_names.append(name)
     return (
         model_type == QWEN4_EXP_MODEL_TYPE
         or text_model_type == QWEN4_EXP_MODEL_TYPE
@@ -68,6 +73,8 @@ def is_qwen4_exp_config(config: Mapping[str, object]) -> bool:
 
 def resolve_mlx_lm_model_classes(
     config: dict[str, Any],
+    *,
+    get_classes: Callable[[dict[str, Any]], tuple[type[Any], type[Any]]] | None = None,
 ) -> tuple[type[Any], type[Any]]:
     """Resolve mlx_lm Model / ModelArgs, with a Flash-Next-specific error.
 
@@ -75,10 +82,19 @@ def resolve_mlx_lm_model_classes(
     ``model_file``. If mlx_lm later vendors ``qwen4_exp``, ``_get_classes``
     succeeds and EXO needs no further change on the construct path.
     """
-    from mlx_lm.utils import _get_classes
+    resolve_classes = get_classes
+    if resolve_classes is None:
+        mlx_lm_utils = importlib.import_module("mlx_lm.utils")
+        imported_get_classes = getattr(mlx_lm_utils, "_get_classes", None)
+        if not callable(imported_get_classes):
+            raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE)
+        resolve_classes = cast(
+            Callable[[dict[str, Any]], tuple[type[Any], type[Any]]],
+            imported_get_classes,
+        )
 
     try:
-        return cast(tuple[type[Any], type[Any]], _get_classes(config))
+        return resolve_classes(config)
     except (ValueError, ImportError, AttributeError, ModuleNotFoundError) as error:
         if not is_qwen4_exp_config(config):
             raise
@@ -89,20 +105,27 @@ def load_mlx_lm_model(
     model_path: Path,
     *,
     trust_remote_code: bool,
-) -> tuple[Any, dict[str, Any]]:
+    load_model: Callable[..., tuple[object, dict[str, Any]]] | None = None,
+) -> tuple[object, dict[str, Any]]:
     """Load weights through mlx_lm, forwarding EXO hooks the pin supports.
 
     Older mlx_lm forks (including some EXO pins) omit
     ``trust_remote_code`` / ``get_model_classes``. Those kwargs are only
     passed when present so Qwen3 / Qwen3.5 / Llama loads stay unchanged.
     """
-    from mlx_lm.utils import load_model
+    loader = load_model
+    if loader is None:
+        mlx_lm_utils = importlib.import_module("mlx_lm.utils")
+        loader = cast(
+            Callable[..., tuple[object, dict[str, Any]]],
+            mlx_lm_utils.load_model,
+        )
 
     load_parameters: dict[str, Any] = {"lazy": True, "strict": False}
-    signature = inspect.signature(load_model)
+    signature = inspect.signature(loader)
     if "trust_remote_code" in signature.parameters:
         load_parameters["trust_remote_code"] = trust_remote_code
     if "get_model_classes" in signature.parameters:
         load_parameters["get_model_classes"] = resolve_mlx_lm_model_classes
-    model, config = load_model(model_path, **load_parameters)
-    return model, cast(dict[str, Any], config)
+    model, config = loader(model_path, **load_parameters)
+    return model, config

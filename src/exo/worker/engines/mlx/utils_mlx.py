@@ -173,10 +173,11 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_mlx_lm_model(
+        loaded_model, _ = load_mlx_lm_model(
             model_path,
             trust_remote_code=bound_instance.bound_shard.model_card.trust_remote_code,
         )
+        model = cast(nn.Module, loaded_model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -239,10 +240,11 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_mlx_lm_model(
+    loaded_model, _ = load_mlx_lm_model(
         model_path,
         trust_remote_code=shard_metadata.model_card.trust_remote_code,
     )
+    model = cast(nn.Module, loaded_model)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

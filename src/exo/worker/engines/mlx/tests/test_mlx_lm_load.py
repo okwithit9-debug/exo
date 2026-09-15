@@ -1,7 +1,6 @@
 import inspect
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -20,48 +19,46 @@ def test_resolve_uses_mlx_lm_when_qwen3_5_is_registered() -> None:
     sentinel_model = type("Model", (), {})
     sentinel_args = type("ModelArgs", (), {})
 
-    with patch(
-        "mlx_lm.utils._get_classes",
-        return_value=(sentinel_model, sentinel_args),
-        create=True,
-    ):
-        model_class, args_class = resolve_mlx_lm_model_classes(
-            {
-                "model_type": "qwen3_5",
-                "architectures": ["Qwen3_5ForConditionalGeneration"],
-            }
-        )
+    def get_classes(
+        config: dict[str, Any],
+    ) -> tuple[type[Any], type[Any]]:
+        assert config["model_type"] == "qwen3_5"
+        return sentinel_model, sentinel_args
+
+    model_class, args_class = resolve_mlx_lm_model_classes(
+        {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+        },
+        get_classes=get_classes,
+    )
     assert model_class is sentinel_model
     assert args_class is sentinel_args
 
 
 def test_resolve_raises_documented_error_for_qwen4_exp() -> None:
-    with (
-        patch(
-            "mlx_lm.utils._get_classes",
-            side_effect=ValueError("Model type qwen4_exp not supported."),
-            create=True,
-        ),
-        pytest.raises(Qwen4ExpUnavailableError, match="ml-explore/mlx-lm/pull/1788"),
-    ):
+    def get_classes(_config: dict[str, Any]) -> tuple[type[Any], type[Any]]:
+        raise ValueError("Model type qwen4_exp not supported.")
+
+    with pytest.raises(Qwen4ExpUnavailableError, match="ml-explore/mlx-lm/pull/1788"):
         resolve_mlx_lm_model_classes(
             {
                 "model_type": "qwen4_exp",
                 "architectures": ["Qwen4ExpForConditionalGeneration"],
-            }
+            },
+            get_classes=get_classes,
         )
 
 
 def test_resolve_does_not_rewrite_unknown_non_flash_next_errors() -> None:
-    with (
-        patch(
-            "mlx_lm.utils._get_classes",
-            side_effect=ValueError("Model type llama-unknown not supported."),
-            create=True,
-        ),
-        pytest.raises(ValueError, match="llama-unknown"),
-    ):
-        resolve_mlx_lm_model_classes({"model_type": "llama-unknown"})
+    def get_classes(_config: dict[str, Any]) -> tuple[type[Any], type[Any]]:
+        raise ValueError("Model type llama-unknown not supported.")
+
+    with pytest.raises(ValueError, match="llama-unknown"):
+        resolve_mlx_lm_model_classes(
+            {"model_type": "llama-unknown"},
+            get_classes=get_classes,
+        )
 
 
 def test_load_mlx_lm_model_forwards_hooks_when_supported() -> None:
@@ -77,18 +74,15 @@ def test_load_mlx_lm_model_forwards_hooks_when_supported() -> None:
         assert strict is False
         assert trust_remote_code is True
         assert get_model_classes is resolve_mlx_lm_model_classes
-        return ("model", {"model_type": "qwen3_5"})
+        assert model_path == Path("/tmp/qwen38")
+        return "model", {"model_type": "qwen3_5"}
 
-    with patch(
-        "mlx_lm.utils.load_model",
-        fake_load_model,
-        create=True,
-    ):
-        model, config = load_mlx_lm_model(
-            Path("/tmp/qwen38"),
-            trust_remote_code=True,
-        )
-    assert model == "model"
+    loaded_model, config = load_mlx_lm_model(
+        Path("/tmp/qwen38"),
+        trust_remote_code=True,
+        load_model=fake_load_model,
+    )
+    assert loaded_model == "model"
     assert config["model_type"] == "qwen3_5"
 
 
@@ -104,9 +98,12 @@ def test_load_mlx_lm_model_skips_unknown_kwargs_on_old_mlx_lm() -> None:
         return ("old-model", {"model_type": "llama"})
 
     assert "trust_remote_code" not in inspect.signature(old_load_model).parameters
-    with patch("mlx_lm.utils.load_model", old_load_model, create=True):
-        model, config = load_mlx_lm_model(Path("/tmp/llama"), trust_remote_code=True)
-    assert model == "old-model"
+    loaded_model, config = load_mlx_lm_model(
+        Path("/tmp/llama"),
+        trust_remote_code=True,
+        load_model=old_load_model,
+    )
+    assert loaded_model == "old-model"
     assert config["model_type"] == "llama"
     assert captured == {
         "lazy": True,

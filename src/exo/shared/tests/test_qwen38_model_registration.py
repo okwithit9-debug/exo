@@ -1,12 +1,11 @@
-from pathlib import Path
-
 import pytest
+from anyio import Path
 
 from exo.shared.constants import RESOURCES_DIR
 from exo.shared.models.model_cards import ConfigData, ModelCard
 from exo.shared.types.common import ModelId
 
-_CARDS_DIR = Path(RESOURCES_DIR) / "inference_model_cards"
+_CARDS_DIR = Path(str(RESOURCES_DIR)) / "inference_model_cards"
 
 
 def _qwen38_27b_config() -> dict[str, object]:
