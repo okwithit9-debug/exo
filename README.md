@@ -523,6 +523,31 @@ curl -X POST http://localhost:52415/models/add \
 
 Custom models requiring `trust_remote_code` in their configuration must be explicitly enabled (default is false) for security. Only enable this if you trust the model's remote code execution. Models are fetched from HuggingFace and stored locally as custom model cards.
 
+### Qwen3.8
+
+**Qwen3.8-27B** (including uncensored MLX packs) uses the same architecture as Qwen3.5/3.6 27B: `architectures: ["Qwen3_5ForConditionalGeneration"]` and `model_type: "qwen3_5"`. EXO already loads that family through `mlx_lm.models.qwen3_5`, including Mac+Spark tensor/pipeline parallel. First-class catalog IDs:
+
+- `mlx-community/Qwen3.8-27B-4bit`
+- `mlx-community/Qwen3.8-27B-8bit`
+
+Uncensored is a weight-pack difference, not a new EXO architecture. To run a local uncensored MLX directory:
+
+1. Keep the pack's `config.json` as `Qwen3_5ForConditionalGeneration` / `qwen3_5`.
+2. Place or symlink the directory at `$EXO_HOME/models/<org>--<name>/` (slashes in the HuggingFace id become `--`). Example: `~/.local/share/exo/models/someone--Qwen3.8-27B-Uncensored-MLX-4bit/`.
+3. Register it: `curl -X POST http://localhost:52415/models/add -H 'Content-Type: application/json' -d '{"model_id":"someone/Qwen3.8-27B-Uncensored-MLX-4bit"}'`.
+4. Or drop a custom card TOML under `~/.local/share/exo/custom_model_cards/` with that `model_id`. You can also symlink a local pack onto `mlx-community--Qwen3.8-27B-4bit` if it is a drop-in replacement for the official 4-bit card.
+
+**Qwen3.8-Flash-Next** (`mlx-community/Qwen3.8-Flash-Next-4bit`) is `Qwen4ExpForConditionalGeneration` / `qwen4_exp`. EXO allowlists that architecture and will pass `trust_remote_code` into `mlx_lm.utils.load_model` when the pin supports it.
+
+| Pin | Role |
+| --- | --- |
+| Current `mlx-lm` extra (`rltakashige/mlx-lm` `leo/deepseek-v4`) | Loads Qwen3.8-27B via `qwen3_5`. Does **not** ship `qwen4_exp`. |
+| [ml-explore/mlx-lm#1788](https://github.com/ml-explore/mlx-lm/pull/1788) | Unmerged. Next step for native Flash-Next construct + typed `auto_parallel` layers. |
+| Community packs with `config.json` `model_file` (for example `qwen4_exp.py`) | Load if `trust_remote_code=true` on the card and mlx_lm accepts that kwarg. |
+| `mlx-vlm>=0.6.17` (PR #2032) | Standalone Flash-Next VLM outside EXO. Not wired into EXO disaggregation. |
+
+TODO after mlx_lm vendors `qwen4_exp`: add typed Qwen4Exp handlers in `auto_parallel.py` (hybrid GDN + QSA cache indices, MoE shard) so Mac+Spark prefill/decode matches Qwen3-Next/Qwen3.5. Until then, Flash-Next may download and appear in `/v1/models` / `/models`, but construct fails with `Qwen4ExpUnavailableError` unless a `model_file` pack is used.
+
 **Other useful API endpoints*:**
 
 - List all models: `curl http://localhost:52415/models`

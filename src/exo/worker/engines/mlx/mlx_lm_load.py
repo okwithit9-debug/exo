@@ -1,0 +1,108 @@
+"""mlx_lm load hooks used by the EXO MLX engine.
+
+Qwen3.8-27B checkpoints declare ``Qwen3_5ForConditionalGeneration`` /
+``model_type: qwen3_5`` and load through stock ``mlx_lm.models.qwen3_5``.
+
+Qwen3.8-Flash-Next checkpoints declare ``Qwen4Exp*`` / ``qwen4_exp``. That
+architecture is not in released mlx_lm (see ml-explore/mlx-lm#1788). Some
+community packs ship a ``model_file`` (typically ``qwen4_exp.py``) that
+``load_model(..., trust_remote_code=True)`` can import. Official
+``mlx-community`` Flash-Next packs do not; those need mlx_lm ``qwen4_exp``
+or a ``model_file`` swap.
+
+mlx-vlm >= 0.6.17 can load Flash-Next as a standalone VLM (PR #2032) but
+is not wired into EXO's mlx_lm disaggregation path.
+"""
+
+from __future__ import annotations
+
+import inspect
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Final, cast
+
+QWEN4_EXP_MODEL_TYPE: Final[str] = "qwen4_exp"
+QWEN4_EXP_ARCHITECTURE_PREFIX: Final[str] = "Qwen4Exp"
+
+QWEN4_EXP_UNAVAILABLE_MESSAGE: Final[str] = (
+    "This checkpoint uses the qwen4_exp / Qwen4Exp* architecture "
+    "(Qwen3.8-Flash-Next). Stock mlx_lm cannot construct it yet "
+    "(unmerged https://github.com/ml-explore/mlx-lm/pull/1788). "
+    "Next step: pin an mlx_lm build that vendors mlx_lm.models.qwen4_exp, "
+    "or use a pack whose config.json sets model_file (for example "
+    "qwen4_exp.py) with trust_remote_code=true on the model card. "
+    "Standalone mlx-vlm>=0.6.17 can load Flash-Next outside EXO; "
+    "Mac+Spark disaggregation still needs the mlx_lm module so "
+    "auto_parallel can see typed Qwen4Exp layers."
+)
+
+
+class Qwen4ExpUnavailableError(ValueError):
+    """Raised when mlx_lm has no qwen4_exp implementation and no model_file.
+
+    Handled at runner load time (``load_mlx_items`` / ``shard_and_load``)
+    so the user sees a concrete next step instead of a generic import error.
+    """
+
+
+def is_qwen4_exp_config(config: Mapping[str, object]) -> bool:
+    """Return True when a HuggingFace / MLX config.json is Flash-Next."""
+    model_type = config.get("model_type")
+    text_config = config.get("text_config")
+    text_model_type: object = None
+    if isinstance(text_config, Mapping):
+        text_model_type = text_config.get("model_type")
+    architectures = config.get("architectures")
+    architecture_names: list[str] = (
+        [str(name) for name in architectures] if isinstance(architectures, list) else []
+    )
+    return (
+        model_type == QWEN4_EXP_MODEL_TYPE
+        or text_model_type == QWEN4_EXP_MODEL_TYPE
+        or any(
+            name.startswith(QWEN4_EXP_ARCHITECTURE_PREFIX)
+            for name in architecture_names
+        )
+    )
+
+
+def resolve_mlx_lm_model_classes(
+    config: dict[str, Any],
+) -> tuple[type[Any], type[Any]]:
+    """Resolve mlx_lm Model / ModelArgs, with a Flash-Next-specific error.
+
+    ``mlx_lm.utils.load_model`` calls this when the checkpoint has no
+    ``model_file``. If mlx_lm later vendors ``qwen4_exp``, ``_get_classes``
+    succeeds and EXO needs no further change on the construct path.
+    """
+    from mlx_lm.utils import _get_classes
+
+    try:
+        return cast(tuple[type[Any], type[Any]], _get_classes(config))
+    except (ValueError, ImportError, AttributeError, ModuleNotFoundError) as error:
+        if not is_qwen4_exp_config(config):
+            raise
+        raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE) from error
+
+
+def load_mlx_lm_model(
+    model_path: Path,
+    *,
+    trust_remote_code: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """Load weights through mlx_lm, forwarding EXO hooks the pin supports.
+
+    Older mlx_lm forks (including some EXO pins) omit
+    ``trust_remote_code`` / ``get_model_classes``. Those kwargs are only
+    passed when present so Qwen3 / Qwen3.5 / Llama loads stay unchanged.
+    """
+    from mlx_lm.utils import load_model
+
+    load_parameters: dict[str, Any] = {"lazy": True, "strict": False}
+    signature = inspect.signature(load_model)
+    if "trust_remote_code" in signature.parameters:
+        load_parameters["trust_remote_code"] = trust_remote_code
+    if "get_model_classes" in signature.parameters:
+        load_parameters["get_model_classes"] = resolve_mlx_lm_model_classes
+    model, config = load_model(model_path, **load_parameters)
+    return model, cast(dict[str, Any], config)

@@ -554,6 +554,8 @@ def tensor_auto_parallel(
             Qwen3_5TextModel,
             Qwen3_5MoeModel,
             Qwen3VLModel,
+            # TODO(qwen4_exp): add Qwen4Exp* once mlx_lm vendors
+            # mlx_lm.models.qwen4_exp (ml-explore/mlx-lm#1788).
         ),
     ):
         tensor_parallel_sharding_strategy = QwenShardingStrategy(

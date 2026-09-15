@@ -50,7 +50,7 @@ mlx-none = ["anyio"]
 mlx = [
   "mlx==0.32.0",
   "mlx-lm",
-  "mlx-vlm>=0.3.11",
+  "mlx-vlm>=0.3.11",  # 27B path uses mlx_lm qwen3_5. Flash-Next standalone VLM needs mlx-vlm>=0.6.17; EXO load still needs mlx_lm qwen4_exp (ml-explore/mlx-lm#1788).
   "mflux==0.17.5",
   "torch==2.10.0; sys_platform == 'darwin'",
   "torch==2.10.0; sys_platform == 'linux'",
