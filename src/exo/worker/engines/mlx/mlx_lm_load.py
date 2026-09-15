@@ -1,17 +1,19 @@
 """mlx_lm load hooks used by the EXO MLX engine.
 
-Qwen3.8-27B checkpoints declare ``Qwen3_5ForConditionalGeneration`` /
-``model_type: qwen3_5`` and load through stock ``mlx_lm.models.qwen3_5``.
-
-Qwen3.8-Flash-Next checkpoints declare ``Qwen4Exp*`` / ``qwen4_exp``. That
-architecture is not in released mlx_lm (see ml-explore/mlx-lm#1788). Some
-community packs ship a ``model_file`` (typically ``qwen4_exp.py``) that
-``load_model(..., trust_remote_code=True)`` can import. Official
-``mlx-community`` Flash-Next packs do not; those need mlx_lm ``qwen4_exp``
-or a ``model_file`` swap.
+The primary Flash-Next target is
+``orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX``
+(``Qwen4ExpForConditionalGeneration`` / ``qwen4_exp``). That architecture
+is not in released mlx_lm (see ml-explore/mlx-lm#1788). Packs that ship a
+``model_file`` (typically ``qwen4_exp.py``) can import via
+``load_model(..., trust_remote_code=True)``. The orcarouter MLX pack is
+converted with mlx-vlm and needs either vendored ``qwen4_exp`` or a
+``model_file`` shim.
 
 mlx-vlm >= 0.6.17 can load Flash-Next as a standalone VLM (PR #2032) but
 is not wired into EXO's mlx_lm disaggregation path.
+
+Qwen3.8-27B remains a secondary ``qwen3_5`` path through stock
+``mlx_lm.models.qwen3_5``.
 """
 
 from __future__ import annotations
@@ -27,14 +29,17 @@ QWEN4_EXP_ARCHITECTURE_PREFIX: Final[str] = "Qwen4Exp"
 
 QWEN4_EXP_UNAVAILABLE_MESSAGE: Final[str] = (
     "This checkpoint uses the qwen4_exp / Qwen4Exp* architecture "
-    "(Qwen3.8-Flash-Next). Stock mlx_lm cannot construct it yet "
-    "(unmerged https://github.com/ml-explore/mlx-lm/pull/1788). "
+    "(orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX). Stock mlx_lm "
+    "cannot construct it yet (unmerged "
+    "https://github.com/ml-explore/mlx-lm/pull/1788). "
     "Next step: pin an mlx_lm build that vendors mlx_lm.models.qwen4_exp, "
-    "or use a pack whose config.json sets model_file (for example "
-    "qwen4_exp.py) with trust_remote_code=true on the model card. "
-    "Standalone mlx-vlm>=0.6.17 can load Flash-Next outside EXO; "
-    "Mac+Spark disaggregation still needs the mlx_lm module so "
-    "auto_parallel can see typed Qwen4Exp layers."
+    "or add config.json model_file (for example qwen4_exp.py) with "
+    "trust_remote_code=true on the model card. "
+    "Standalone mlx-vlm>=0.6.17 can load this pack outside EXO; "
+    "Mac+Spark EXO disaggregation still needs the mlx_lm module so "
+    "auto_parallel can see typed Qwen4Exp layers. "
+    "orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4 is the Spark vLLM "
+    "companion, not an EXO MLX weight."
 )
 
 

@@ -523,30 +523,30 @@ curl -X POST http://localhost:52415/models/add \
 
 Custom models requiring `trust_remote_code` in their configuration must be explicitly enabled (default is false) for security. Only enable this if you trust the model's remote code execution. Models are fetched from HuggingFace and stored locally as custom model cards.
 
-### Qwen3.8
+### Qwen3.8 Flash-Next (orcarouter Uncensored)
 
-**Qwen3.8-27B** (including uncensored MLX packs) uses the same architecture as Qwen3.5/3.6 27B: `architectures: ["Qwen3_5ForConditionalGeneration"]` and `model_type: "qwen3_5"`. EXO already loads that family through `mlx_lm.models.qwen3_5`, including Mac+Spark tensor/pipeline parallel. First-class catalog IDs:
+The only first-class Flash-Next catalog id is:
 
-- `mlx-community/Qwen3.8-27B-4bit`
-- `mlx-community/Qwen3.8-27B-8bit`
+- `orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX` — EXO MLX weights (`Qwen4ExpForConditionalGeneration` / `qwen4_exp`). Default 4-bit files are at the repo root; accept the HuggingFace gate and set a Hub token before download.
 
-Uncensored is a weight-pack difference, not a new EXO architecture. To run a local uncensored MLX directory:
+Spark vLLM companion in the same product family (not an EXO MLX card, do not launch it on the MLX engine):
 
-1. Keep the pack's `config.json` as `Qwen3_5ForConditionalGeneration` / `qwen3_5`.
-2. Place or symlink the directory at `$EXO_HOME/models/<org>--<name>/` (slashes in the HuggingFace id become `--`). Example: `~/.local/share/exo/models/someone--Qwen3.8-27B-Uncensored-MLX-4bit/`.
-3. Register it: `curl -X POST http://localhost:52415/models/add -H 'Content-Type: application/json' -d '{"model_id":"someone/Qwen3.8-27B-Uncensored-MLX-4bit"}'`.
-4. Or drop a custom card TOML under `~/.local/share/exo/custom_model_cards/` with that `model_id`. You can also symlink a local pack onto `mlx-community--Qwen3.8-27B-4bit` if it is a drop-in replacement for the official 4-bit card.
+- `orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4`
 
-**Qwen3.8-Flash-Next** (`mlx-community/Qwen3.8-Flash-Next-4bit`) is `Qwen4ExpForConditionalGeneration` / `qwen4_exp`. EXO allowlists that architecture and will pass `trust_remote_code` into `mlx_lm.utils.load_model` when the pin supports it.
+Do not treat mlx-community / lychee888 / other Flash-Next quants as the default EXO model. Uncensored here is a weight pack (abliteration), not a separate architecture: EXO only needs the `qwen4_exp` load path.
+
+Place a local copy at `$EXO_HOME/models/orcarouter--Qwen3.8-Flash-Next-Uncensored-MLX/` if you already downloaded the MLX dir.
 
 | Pin | Role |
 | --- | --- |
-| Current `mlx-lm` extra (`rltakashige/mlx-lm` `leo/deepseek-v4`) | Loads Qwen3.8-27B via `qwen3_5`. Does **not** ship `qwen4_exp`. |
-| [ml-explore/mlx-lm#1788](https://github.com/ml-explore/mlx-lm/pull/1788) | Unmerged. Next step for native Flash-Next construct + typed `auto_parallel` layers. |
-| Community packs with `config.json` `model_file` (for example `qwen4_exp.py`) | Load if `trust_remote_code=true` on the card and mlx_lm accepts that kwarg. |
+| Current `mlx-lm` extra (`rltakashige/mlx-lm` `leo/deepseek-v4`) | No `qwen4_exp` module. |
+| [ml-explore/mlx-lm#1788](https://github.com/ml-explore/mlx-lm/pull/1788) | Unmerged. Next step for native construct + typed `auto_parallel` layers. |
+| `config.json` `model_file` (for example `qwen4_exp.py`) | Load if `trust_remote_code=true` on the card and mlx_lm accepts that kwarg. |
 | `mlx-vlm>=0.6.17` (PR #2032) | Standalone Flash-Next VLM outside EXO. Not wired into EXO disaggregation. |
 
-TODO after mlx_lm vendors `qwen4_exp`: add typed Qwen4Exp handlers in `auto_parallel.py` (hybrid GDN + QSA cache indices, MoE shard) so Mac+Spark prefill/decode matches Qwen3-Next/Qwen3.5. Until then, Flash-Next may download and appear in `/v1/models` / `/models`, but construct fails with `Qwen4ExpUnavailableError` unless a `model_file` pack is used.
+TODO after mlx_lm vendors `qwen4_exp`: add typed Qwen4Exp handlers in `auto_parallel.py` (hybrid GDN + QSA cache indices, MoE shard) so Mac+Spark prefill/decode matches Qwen3-Next/Qwen3.5. Until then the orcarouter card appears in `/v1/models` / `/models`, but construct fails with `Qwen4ExpUnavailableError` unless a `model_file` shim is present.
+
+Qwen3.8-27B (`mlx-community/Qwen3.8-27B-4bit` / `8bit`) is a secondary `qwen3_5` path only.
 
 **Other useful API endpoints*:**
 

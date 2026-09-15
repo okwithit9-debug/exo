@@ -61,8 +61,8 @@ def _qwen38_flash_next_config() -> dict[str, object]:
             5120,
         ),
         (
-            "mlx-community--Qwen3.8-Flash-Next-4bit.toml",
-            "mlx-community/Qwen3.8-Flash-Next-4bit",
+            "orcarouter--Qwen3.8-Flash-Next-Uncensored-MLX.toml",
+            "orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX",
             48,
             2560,
         ),
@@ -98,7 +98,7 @@ async def test_qwen38_27b_card_is_qwen3_5_load_compatible() -> None:
 async def test_qwen38_flash_next_arch_is_allowlisted() -> None:
     config = ConfigData.model_validate(
         _qwen38_flash_next_config(),
-        context={"model_id": "mlx-community/Qwen3.8-Flash-Next-4bit"},
+        context={"model_id": "orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX"},
     )
     assert config.supports_tensor is True
     assert config.layer_count == 48
@@ -124,7 +124,18 @@ def test_uncensored_qwen38_27b_is_same_architecture() -> None:
 
 
 def test_local_mlx_dir_uses_normalized_model_id() -> None:
-    model_id = ModelId("mlx-community/Qwen3.8-27B-4bit")
-    assert model_id.normalize() == "mlx-community--Qwen3.8-27B-4bit"
-    uncensored = ModelId("someone/Qwen3.8-27B-Uncensored-MLX-4bit")
-    assert uncensored.normalize() == "someone--Qwen3.8-27B-Uncensored-MLX-4bit"
+    primary = ModelId("orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX")
+    assert primary.normalize() == "orcarouter--Qwen3.8-Flash-Next-Uncensored-MLX"
+    secondary_27b = ModelId("mlx-community/Qwen3.8-27B-4bit")
+    assert secondary_27b.normalize() == "mlx-community--Qwen3.8-27B-4bit"
+
+
+async def test_flash_next_catalog_is_orcarouter_only() -> None:
+    assert await (
+        _CARDS_DIR / "orcarouter--Qwen3.8-Flash-Next-Uncensored-MLX.toml"
+    ).exists()
+    assert not await (
+        _CARDS_DIR / "mlx-community--Qwen3.8-Flash-Next-4bit.toml"
+    ).exists()
+    nvfp4 = ModelId("orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4")
+    assert not await (_CARDS_DIR / f"{nvfp4.normalize()}.toml").exists()

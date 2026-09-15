@@ -113,16 +113,20 @@ def test_load_mlx_lm_model_skips_unknown_kwargs_on_old_mlx_lm() -> None:
 
 
 def test_qwen4_exp_error_message_is_actionable() -> None:
+    assert (
+        "orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX" in QWEN4_EXP_UNAVAILABLE_MESSAGE
+    )
     assert "model_file" in QWEN4_EXP_UNAVAILABLE_MESSAGE
     assert "auto_parallel" in QWEN4_EXP_UNAVAILABLE_MESSAGE
+    assert "NVFP4" in QWEN4_EXP_UNAVAILABLE_MESSAGE
 
 
 @pytest.mark.parametrize(
     "model_id",
     [
+        "orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX",
         "mlx-community/Qwen3.8-27B-4bit",
-        "local/Qwen3.8-27B-Uncensored-MLX-4bit",
-        "mlx-community/Qwen3.8-Flash-Next-4bit",
+        "qwen-3.8-flash-next",
         "qwen-3.8-27b",
     ],
 )
