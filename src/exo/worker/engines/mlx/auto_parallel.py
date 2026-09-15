@@ -554,6 +554,10 @@ def tensor_auto_parallel(
             Qwen3_5TextModel,
             Qwen3_5MoeModel,
             Qwen3VLModel,
+            # TODO(qwen4_exp): typed Qwen4Exp* TP/PP. Construct/load is
+            # unblocked by the mlx-vlm shim; add handlers once native
+            # mlx_lm.models.qwen4_exp lands (ml-explore/mlx-lm#1788) or
+            # the shim classes grow stable layer types.
         ),
     ):
         tensor_parallel_sharding_strategy = QwenShardingStrategy(

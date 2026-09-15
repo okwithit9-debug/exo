@@ -523,6 +523,55 @@ curl -X POST http://localhost:52415/models/add \
 
 Custom models requiring `trust_remote_code` in their configuration must be explicitly enabled (default is false) for security. Only enable this if you trust the model's remote code execution. Models are fetched from HuggingFace and stored locally as custom model cards.
 
+### Qwen3.8 Flash-Next (orcarouter Uncensored)
+
+The only first-class Flash-Next catalog id is:
+
+- `orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX` — EXO MLX weights (`Qwen4ExpForConditionalGeneration` / `qwen4_exp`). Default 4-bit files are at the repo root; accept the HuggingFace gate and set a Hub token before download.
+
+Spark vLLM companion in the same product family (not an EXO MLX card, do not launch it on the MLX engine):
+
+- `orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4`
+
+Do not treat mlx-community / lychee888 / other Flash-Next quants as the default EXO model. Uncensored here is a weight pack (abliteration), not a separate architecture: EXO only needs the `qwen4_exp` load path.
+
+Place a local copy at `$EXO_HOME/models/orcarouter--Qwen3.8-Flash-Next-Uncensored-MLX/` if you already downloaded the MLX dir.
+
+#### Construct / install (EXO mlx-vlm shim)
+
+Stock mlx_lm cannot import `qwen4_exp` until [ml-explore/mlx-lm#1788](https://github.com/ml-explore/mlx-lm/pull/1788) merges. EXO unblocks **construct/load** of the orcarouter Uncensored-MLX pack by wrapping `mlx_vlm.models.qwen4_exp` (mlx-vlm >= 0.6.17) as a temporary `mlx_lm.models.qwen4_exp` / `get_model_classes` fallback.
+
+```bash
+# From a checkout that already has the mlx extra:
+pip install 'mlx-vlm>=0.6.17'
+# or, when installing EXO:
+pip install 'exo[mlx]' && pip install 'mlx-vlm>=0.6.17'
+```
+
+Accept the HuggingFace gate and export a Hub token before the first download. Then launch the catalog id as usual (`orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX`). If neither native mlx_lm nor mlx-vlm `qwen4_exp` is importable, load raises `Qwen4ExpUnavailableError` with these install steps.
+
+| Pin | Role |
+| --- | --- |
+| Current `mlx-lm` extra (`rltakashige/mlx-lm` `leo/deepseek-v4`) | No `qwen4_exp` module. EXO injects the shim below. |
+| EXO shim (`src/exo/worker/engines/mlx/vendor/qwen4_exp.py`) | mlx-vlm-backed `Model` / `ModelArgs` so `load_mlx_lm_model` can construct the pack. |
+| `mlx-vlm>=0.6.17` (PR #2032) | Required for the shim (`LanguageModel`, `ModelConfig`, weight `sanitize`). |
+| [ml-explore/mlx-lm#1788](https://github.com/ml-explore/mlx-lm/pull/1788) | Native `mlx_lm.models.qwen4_exp`. Preferred when present; then **remove the shim**. |
+| `config.json` `model_file` (for example `qwen4_exp.py`) | Alternate load if the pack ships one and mlx_lm accepts that path. |
+
+#### Remove the shim when mlx-lm#1788 is available
+
+When `import mlx_lm.models.qwen4_exp` works on the EXO mlx-lm pin:
+
+1. Delete `src/exo/worker/engines/mlx/vendor/qwen4_exp.py`.
+2. Delete the mlx-vlm fallback in `src/exo/worker/engines/mlx/qwen4_exp_shim.py` (keep native resolve + the documented error).
+3. Add typed Qwen4Exp handlers in `auto_parallel.py` (hybrid GDN + QSA cache indices, MoE shard) so Mac+Spark prefill/decode can match Qwen3-Next / Qwen3.5.
+
+#### Remaining gaps (construct ≠ verified Flash-Next generate)
+
+This path is enough for EXO to **construct** the orcarouter Uncensored-MLX module graph and run mlx_lm `load_model` (sanitize + weight assign). It is **not** a claim that a full MoE / hybrid GDN + QSA / PLE n-gram forward + generate loop, or Mac+Spark disaggregated prefill/decode, is verified. Those still need Apple-silicon (or CUDA MLX) runtime, the gated ~163 GiB pack, and typed `auto_parallel` work above. NVFP4 stays Spark vLLM only.
+
+Qwen3.8-27B (`mlx-community/Qwen3.8-27B-4bit` / `8bit`) is a secondary `qwen3_5` path only.
+
 **Other useful API endpoints*:**
 
 - List all models: `curl http://localhost:52415/models`

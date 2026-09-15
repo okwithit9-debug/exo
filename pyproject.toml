@@ -50,7 +50,7 @@ mlx-none = ["anyio"]
 mlx = [
   "mlx==0.32.0",
   "mlx-lm",
-  "mlx-vlm>=0.3.11",
+  "mlx-vlm>=0.3.11",  # orcarouter Flash-Next Uncensored-MLX EXO construct shim needs mlx-vlm>=0.6.17; remove vendor/qwen4_exp.py when mlx-lm#1788 ships.
   "mflux==0.17.5",
   "torch==2.10.0; sys_platform == 'darwin'",
   "torch==2.10.0; sys_platform == 'linux'",
