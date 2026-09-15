@@ -22,6 +22,8 @@ in_bytes = 175019917312
 # Spark vLLM companion in this product family:
 # orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4 (not an EXO MLX card).
 # Stock mlx_lm does not ship qwen4_exp (ml-explore/mlx-lm#1788).
+# EXO constructs this pack via the mlx-vlm>=0.6.17 shim in
+# src/exo/worker/engines/mlx/vendor/qwen4_exp.py until #1788 lands.
 # Source: https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX
 [sampling_defaults]
 temperature = 1.0

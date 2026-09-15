@@ -2,18 +2,18 @@
 
 The primary Flash-Next target is
 ``orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX``
-(``Qwen4ExpForConditionalGeneration`` / ``qwen4_exp``). That architecture
-is not in released mlx_lm (see ml-explore/mlx-lm#1788). Packs that ship a
-``model_file`` (typically ``qwen4_exp.py``) can import via
-``load_model(..., trust_remote_code=True)``. The orcarouter MLX pack is
-converted with mlx-vlm and needs either vendored ``qwen4_exp`` or a
-``model_file`` shim.
+(``Qwen4ExpForConditionalGeneration`` / ``qwen4_exp``). Stock mlx_lm does
+not ship that module yet (ml-explore/mlx-lm#1788). EXO constructs the
+orcarouter pack through:
 
-mlx-vlm >= 0.6.17 can load Flash-Next as a standalone VLM (PR #2032) but
-is not wired into EXO's mlx_lm disaggregation path.
+1. Native ``mlx_lm.models.qwen4_exp`` when the pin has it.
+2. A temporary mlx-vlm>=0.6.17 adapter
+   (``src/exo/worker/engines/mlx/vendor/qwen4_exp.py``).
+3. ``Qwen4ExpUnavailableError`` when neither is importable.
 
-Qwen3.8-27B remains a secondary ``qwen3_5`` path through stock
-``mlx_lm.models.qwen3_5``.
+Packs that ship ``config.json`` ``model_file`` still load through mlx_lm
+when that kwarg path exists. Qwen3.8-27B remains a secondary ``qwen3_5``
+path through stock ``mlx_lm.models.qwen3_5``.
 """
 
 from __future__ import annotations
@@ -24,30 +24,25 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Final, cast
 
+from exo.worker.engines.mlx.qwen4_exp_shim import (
+    QWEN4_EXP_SHIM_INSTALL_MESSAGE,
+    Qwen4ExpClassImporter,
+    import_qwen4_exp_model_classes,
+    install_qwen4_exp_shim_into_mlx_lm,
+    read_mlx_model_config,
+)
+
 QWEN4_EXP_MODEL_TYPE: Final[str] = "qwen4_exp"
 QWEN4_EXP_ARCHITECTURE_PREFIX: Final[str] = "Qwen4Exp"
-
-QWEN4_EXP_UNAVAILABLE_MESSAGE: Final[str] = (
-    "This checkpoint uses the qwen4_exp / Qwen4Exp* architecture "
-    "(orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX). Stock mlx_lm "
-    "cannot construct it yet (unmerged "
-    "https://github.com/ml-explore/mlx-lm/pull/1788). "
-    "Next step: pin an mlx_lm build that vendors mlx_lm.models.qwen4_exp, "
-    "or add config.json model_file (for example qwen4_exp.py) with "
-    "trust_remote_code=true on the model card. "
-    "Standalone mlx-vlm>=0.6.17 can load this pack outside EXO; "
-    "Mac+Spark EXO disaggregation still needs the mlx_lm module so "
-    "auto_parallel can see typed Qwen4Exp layers. "
-    "orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4 is the Spark vLLM "
-    "companion, not an EXO MLX weight."
-)
+QWEN4_EXP_UNAVAILABLE_MESSAGE: Final[str] = QWEN4_EXP_SHIM_INSTALL_MESSAGE
 
 
 class Qwen4ExpUnavailableError(ValueError):
-    """Raised when mlx_lm has no qwen4_exp implementation and no model_file.
+    """Raised when neither mlx_lm nor the mlx-vlm shim can construct qwen4_exp.
 
     Handled at runner load time (``load_mlx_items`` / ``shard_and_load``)
-    so the user sees a concrete next step instead of a generic import error.
+    so the user sees install / removal steps instead of a generic import
+    error.
     """
 
 
@@ -80,30 +75,49 @@ def resolve_mlx_lm_model_classes(
     config: dict[str, Any],
     *,
     get_classes: Callable[[dict[str, Any]], tuple[type[Any], type[Any]]] | None = None,
+    import_qwen4_exp_classes: Qwen4ExpClassImporter | None = None,
 ) -> tuple[type[Any], type[Any]]:
-    """Resolve mlx_lm Model / ModelArgs, with a Flash-Next-specific error.
+    """Resolve mlx_lm Model / ModelArgs, falling back to the qwen4_exp shim.
 
     ``mlx_lm.utils.load_model`` calls this when the checkpoint has no
-    ``model_file``. If mlx_lm later vendors ``qwen4_exp``, ``_get_classes``
-    succeeds and EXO needs no further change on the construct path.
+    ``model_file``. Native ``mlx_lm.models.qwen4_exp`` wins. Otherwise the
+    mlx-vlm adapter is used until mlx-lm#1788 lands.
     """
     resolve_classes = get_classes
     if resolve_classes is None:
-        mlx_lm_utils = importlib.import_module("mlx_lm.utils")
-        imported_get_classes = getattr(mlx_lm_utils, "_get_classes", None)
-        if not callable(imported_get_classes):
-            raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE)
-        resolve_classes = cast(
-            Callable[[dict[str, Any]], tuple[type[Any], type[Any]]],
-            imported_get_classes,
-        )
+        try:
+            mlx_lm_utils = importlib.import_module("mlx_lm.utils")
+        except (ModuleNotFoundError, ImportError):
+            mlx_lm_utils = None
+        if mlx_lm_utils is not None:
+            imported_get_classes = getattr(mlx_lm_utils, "_get_classes", None)
+            if callable(imported_get_classes):
+                resolve_classes = cast(
+                    Callable[[dict[str, Any]], tuple[type[Any], type[Any]]],
+                    imported_get_classes,
+                )
 
-    try:
-        return resolve_classes(config)
-    except (ValueError, ImportError, AttributeError, ModuleNotFoundError) as error:
-        if not is_qwen4_exp_config(config):
-            raise
-        raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE) from error
+    native_error: Exception | None = None
+    if resolve_classes is not None:
+        try:
+            return resolve_classes(config)
+        except (ValueError, ImportError, AttributeError, ModuleNotFoundError) as error:
+            native_error = error
+            if not is_qwen4_exp_config(config):
+                raise
+
+    if not is_qwen4_exp_config(config):
+        raise ValueError("mlx_lm model class resolution is unavailable")
+
+    load_shim_classes = (
+        import_qwen4_exp_classes
+        if import_qwen4_exp_classes is not None
+        else import_qwen4_exp_model_classes
+    )
+    shim_classes = load_shim_classes()
+    if shim_classes is None:
+        raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE) from native_error
+    return cast(tuple[type[Any], type[Any]], shim_classes)
 
 
 def load_mlx_lm_model(
@@ -111,13 +125,27 @@ def load_mlx_lm_model(
     *,
     trust_remote_code: bool,
     load_model: Callable[..., tuple[object, dict[str, Any]]] | None = None,
+    import_qwen4_exp_classes: Qwen4ExpClassImporter | None = None,
 ) -> tuple[object, dict[str, Any]]:
     """Load weights through mlx_lm, forwarding EXO hooks the pin supports.
 
-    Older mlx_lm forks (including some EXO pins) omit
-    ``trust_remote_code`` / ``get_model_classes``. Those kwargs are only
-    passed when present so Qwen3 / Qwen3.5 / Llama loads stay unchanged.
+    For Flash-Next, install the mlx-vlm shim into ``mlx_lm.models.qwen4_exp``
+    when native classes are missing, and pass ``get_model_classes`` when the
+    loader accepts it. Older mlx_lm forks omit ``trust_remote_code`` /
+    ``get_model_classes``; those kwargs are only passed when present so
+    Qwen3 / Qwen3.5 / Llama loads stay unchanged.
     """
+    load_shim_classes = (
+        import_qwen4_exp_classes
+        if import_qwen4_exp_classes is not None
+        else import_qwen4_exp_model_classes
+    )
+    disk_config = read_mlx_model_config(model_path)
+    if disk_config is not None and is_qwen4_exp_config(disk_config):
+        if load_shim_classes() is None:
+            raise Qwen4ExpUnavailableError(QWEN4_EXP_UNAVAILABLE_MESSAGE)
+        _ = install_qwen4_exp_shim_into_mlx_lm()
+
     loader = load_model
     if loader is None:
         mlx_lm_utils = importlib.import_module("mlx_lm.utils")
@@ -131,6 +159,18 @@ def load_mlx_lm_model(
     if "trust_remote_code" in signature.parameters:
         load_parameters["trust_remote_code"] = trust_remote_code
     if "get_model_classes" in signature.parameters:
-        load_parameters["get_model_classes"] = resolve_mlx_lm_model_classes
+        if import_qwen4_exp_classes is None:
+            load_parameters["get_model_classes"] = resolve_mlx_lm_model_classes
+        else:
+
+            def resolve_with_injected_shim(
+                config: dict[str, Any],
+            ) -> tuple[type[Any], type[Any]]:
+                return resolve_mlx_lm_model_classes(
+                    config,
+                    import_qwen4_exp_classes=import_qwen4_exp_classes,
+                )
+
+            load_parameters["get_model_classes"] = resolve_with_injected_shim
     model, config = loader(model_path, **load_parameters)
     return model, config
