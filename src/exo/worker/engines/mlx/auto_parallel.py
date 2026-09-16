@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
 import numpy as np
+import socket
+import struct
 import mlx.nn as nn
 from mlx.nn.layers.distributed import (
     shard_inplace,
@@ -80,6 +82,75 @@ def _pp_barrier(group: mx.distributed.Group) -> None:
             mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
         )
     )
+
+
+
+def _tcp_broadcast_final_hidden(
+    rank: int,
+    world: int,
+    output: mx.array,
+) -> mx.array:
+    """Broadcast last-rank hidden to earlier ranks over TCP (Metal↔CUDA safe)."""
+    peer = __import__("os").environ.get("EXO_PP_PEER_IP", "").strip()
+    port = int(__import__("os").environ.get("EXO_PP_SYNC_PORT", "52416"))
+    if not peer:
+        raise RuntimeError("EXO_PP_PEER_IP is required for PP decode broadcast")
+
+    if rank == world - 1:
+        mx.eval(output)
+        mx.synchronize()
+        host = np.ascontiguousarray(np.array(output), dtype=np.float32)
+        shape = host.shape
+        payload = host.tobytes()
+        header = struct.pack("!I", len(shape)) + struct.pack("!" + "I" * len(shape), *shape)
+        header += struct.pack("!I", len(payload))
+        for _dst in range(world - 1):
+            # Last rank connects to each earlier peer (earlier is listening).
+            # For 2-node, peer env is the other machine.
+            deadline = __import__("time").time() + 60
+            last_err: Exception | None = None
+            while __import__("time").time() < deadline:
+                try:
+                    with socket.create_connection((peer, port), timeout=2.0) as sock:
+                        sock.sendall(header)
+                        sock.sendall(payload)
+                    last_err = None
+                    break
+                except OSError as e:
+                    last_err = e
+                    __import__("time").sleep(0.05)
+            if last_err is not None:
+                raise last_err
+        print(f"[PP] tcp broadcast send rank={rank} shape={shape} bytes={len(payload)}", flush=True)
+        return output
+
+    # Earlier ranks: listen, accept one connection from last rank.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(1)
+    srv.settimeout(120.0)
+    print(f"[PP] tcp broadcast recv listening :{port} rank={rank}", flush=True)
+    conn, _addr = srv.accept()
+    with conn:
+        def recvn(n: int) -> bytes:
+            buf = b""
+            while len(buf) < n:
+                chunk = conn.recv(n - len(buf))
+                if not chunk:
+                    raise RuntimeError("tcp broadcast closed early")
+                buf += chunk
+            return buf
+
+        ndim = struct.unpack("!I", recvn(4))[0]
+        shape = struct.unpack("!" + "I" * ndim, recvn(4 * ndim))
+        nbytes = struct.unpack("!I", recvn(4))[0]
+        payload = recvn(nbytes)
+    srv.close()
+    host = np.frombuffer(payload, dtype=np.float32).reshape(shape).copy()
+    print(f"[PP] tcp broadcast recv rank={rank} shape={shape}", flush=True)
+    return mx.array(host)
+
 
 
 def flush_prefill_sends() -> None:
@@ -234,39 +305,9 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            # Metal↔CUDA: GPU all_gather / Metal-backed send hang. Host-copy the
-            # final hidden, then CPU-stream send/recv (same take-last semantics).
-            cpu = mx.default_stream(mx.Device(mx.cpu))
-            if self.r == self.s - 1:
-                mx.eval(output)
-                mx.synchronize()
-                host = np.array(output)
-                out_cpu = mx.array(host)
-                for dst in range(self.s - 1):
-                    print(
-                        f"[PP] decode broadcast send {self.r}->{dst} shape={host.shape}",
-                        flush=True,
-                    )
-                    logger.info(
-                        f"PP decode broadcast send {self.r}->{dst} shape={host.shape}"
-                    )
-                    with mx.stream(cpu):
-                        sent = mx.distributed.send(out_cpu, dst, group=self.group)
-                        mx.eval(sent)
-            else:
-                src = self.s - 1
-                # Fresh CPU placeholder — do not reuse Metal activation graph.
-                placeholder = mx.zeros(output.shape, dtype=output.dtype)
-                print(
-                    f"[PP] decode broadcast recv {self.r}<-{src} shape={tuple(output.shape)}",
-                    flush=True,
-                )
-                logger.info(
-                    f"PP decode broadcast recv {self.r}<-{src} shape={tuple(output.shape)}"
-                )
-                with mx.stream(cpu):
-                    output = mx.distributed.recv_like(placeholder, src, group=self.group)
-                    mx.eval(output)
+            # Metal↔CUDA MLX reverse send/all_gather hang. TCP broadcast of the
+            # final hidden gives the same take-last semantics without MLX.
+            output = _tcp_broadcast_final_hidden(self.r, self.s, output)
 
         return output
 
