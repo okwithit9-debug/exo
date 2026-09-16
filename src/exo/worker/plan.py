@@ -200,18 +200,9 @@ def _init_distributed_backend(
         assert device_rank < world_size
         assert device_rank >= 0
 
-        accepting_ranks = device_rank < world_size - 1
-
-        # Rank = n-1
-        connecting_rank_ready = device_rank == world_size - 1 and all(
-            isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
-            for global_runner_id in shard_assignments.runner_to_shard
-            if global_runner_id != runner_id
-        )
-
-        if not (accepting_ranks or connecting_rank_ready):
-            continue
-
+        # Start every rank together. MLX ring dials peers; utils_mlx retries
+        # ECONNREFUSED until the peer is listening. The old "last rank waits for
+        # RunnerConnecting" race let rank0 fail before rank1 ever bound.
         return ConnectToGroup(instance_id=instance.instance_id)
 
     return None

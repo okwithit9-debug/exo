@@ -118,7 +118,26 @@ def mlx_distributed_init(
                 os.environ["MLX_RANK"] = str(rank)
                 # os.environ["MLX_RING_VERBOSE"] = "1"  # NOTE: we don't use it enough to care (turn on again if need to)
 
-                group = mx.distributed.init(backend="ring", strict=True)
+                # Peer may not be listening yet (last rank starts after rank0 is
+                # RunnerConnecting). Retry ECONNREFUSED / ring connect failures.
+                group = None
+                last_err: Exception | None = None
+                for attempt in range(1, 61):
+                    try:
+                        group = mx.distributed.init(backend="ring", strict=True)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        msg = str(e)
+                        if "Couldn't connect" not in msg and "error: 111" not in msg and "Connection refused" not in msg:
+                            raise
+                        logger.warning(
+                            f"rank {rank} ring connect attempt {attempt}/60 failed: {e}; retrying"
+                        )
+                        time.sleep(1.0)
+                if group is None:
+                    assert last_err is not None
+                    raise last_err
 
             case MlxJacclInstance(
                 jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
