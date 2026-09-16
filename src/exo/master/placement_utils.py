@@ -111,7 +111,10 @@ def _allocate_and_validate_layers(
 
     total_storage = model_card.storage_size
     total_layers = model_card.n_layers
-    max_layers = max(1, int(total_layers * EXO_MAX_LAYER_FRAC))
+    # Always allow an even pipeline split (e.g. 32/32 on 64 layers). The 0.45
+    # cap is for uneven Flash-sized packs; equal 2-node 27B must not oscillate.
+    even_share = (total_layers + len(node_ids) - 1) // len(node_ids)
+    max_layers = max(even_share, max(1, int(total_layers * EXO_MAX_LAYER_FRAC)))
     # Rebalance: move surplus layers from over-cap nodes to the node with most spare RAM
     guard = 0
     while max(layer_allocations) > max_layers and guard < total_layers:
