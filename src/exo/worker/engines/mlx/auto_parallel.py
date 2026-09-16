@@ -97,9 +97,10 @@ def _tcp_broadcast_final_hidden(
         raise RuntimeError("EXO_PP_PEER_IP is required for PP decode broadcast")
 
     if rank == world - 1:
-        mx.eval(output)
+        out_f32 = output.astype(mx.float32)
+        mx.eval(out_f32)
         mx.synchronize()
-        host = np.ascontiguousarray(np.array(output), dtype=np.float32)
+        host = np.ascontiguousarray(np.array(out_f32), dtype=np.float32)
         shape = host.shape
         payload = host.tobytes()
         header = struct.pack("!I", len(shape)) + struct.pack("!" + "I" * len(shape), *shape)
@@ -155,9 +156,10 @@ def _tcp_broadcast_final_hidden(
 
 
 def _tcp_send_array(peer: str, port: int, arr: mx.array) -> None:
-    mx.eval(arr)
+    arr_f32 = arr.astype(mx.float32)
+    mx.eval(arr_f32)
     mx.synchronize()
-    host = np.ascontiguousarray(np.array(arr), dtype=np.float32)
+    host = np.ascontiguousarray(np.array(arr_f32), dtype=np.float32)
     shape = host.shape
     payload = host.tobytes()
     header = struct.pack("!I", len(shape)) + struct.pack("!" + "I" * len(shape), *shape)
