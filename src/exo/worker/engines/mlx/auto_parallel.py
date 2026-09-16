@@ -233,10 +233,10 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            # Metal↔CUDA: all_gather during decode deadlocks (rank0 in gather
-            # while rank1 still in Metal forward, or gather itself hangs).
-            # Same effect as all_gather+take-last: last rank broadcasts its
-            # final hidden to earlier ranks via send/recv (works on this ring).
+            # Metal↔CUDA: GPU all_gather and Metal→CUDA send both hang.
+            # Move the final-hidden broadcast onto the CPU stream (same shape
+            # semantics as all_gather + take-last shard).
+            cpu = mx.default_stream(mx.Device(mx.cpu))
             if self.r == self.s - 1:
                 for dst in range(self.s - 1):
                     print(
@@ -246,9 +246,12 @@ class PipelineLastLayer(CustomMlxLayer):
                     logger.info(
                         f"PP decode broadcast send {self.r}->{dst} shape={getattr(output, 'shape', None)}"
                     )
-                    sent = mx.distributed.send(output, dst, group=self.group)
-                    mx.async_eval(sent)
-                    mx.eval(sent)
+                    # Materialize on CPU before distributed send.
+                    out_cpu = output
+                    mx.eval(out_cpu)
+                    with mx.stream(cpu):
+                        sent = mx.distributed.send(out_cpu, dst, group=self.group)
+                        mx.eval(sent)
                 mx.synchronize()
             else:
                 src = self.s - 1
@@ -259,8 +262,9 @@ class PipelineLastLayer(CustomMlxLayer):
                 logger.info(
                     f"PP decode broadcast recv {self.r}<-{src} shape={getattr(output, 'shape', None)}"
                 )
-                output = mx.distributed.recv_like(output, src, group=self.group)
-                mx.eval(output)
+                with mx.stream(cpu):
+                    output = mx.distributed.recv_like(output, src, group=self.group)
+                    mx.eval(output)
                 mx.synchronize()
 
         return output
