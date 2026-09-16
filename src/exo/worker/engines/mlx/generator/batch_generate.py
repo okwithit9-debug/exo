@@ -34,11 +34,17 @@ from exo.worker.engines.mlx.cache import (
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
+    RemotePrefillRequired,
     ban_token_ids,
+    environment_flag_enabled,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
+    materialize_cache_on_mlx_lm_generation_stream,
     patch_embed_tokens,
     prefill,
+    remote_prefill_minimum_tokens,
+    resolve_prefill_mode,
+    token_ids_from_prompt,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
@@ -59,7 +65,6 @@ from exo.worker.engines.mlx.vision import (
 from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
-REMOTE_PREFILL_MIN_TOKENS = 1000
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
@@ -203,9 +208,12 @@ class ExoBatchGenerator:
             else contextlib.nullcontext()
         )
         uncached_count = len(prompt_tokens)
-        use_remote = (
-            uncached_count > REMOTE_PREFILL_MIN_TOKENS
-            and task_params.prefill_endpoint is not None
+        require_remote_prefill = environment_flag_enabled("EXO_REQUIRE_REMOTE_PREFILL")
+        prefill_mode = resolve_prefill_mode(
+            uncached_count,
+            task_params.prefill_endpoint,
+            require_remote=require_remote_prefill,
+            minimum_tokens=remote_prefill_minimum_tokens(),
         )
 
         _prefill_tps: float = 0.0
@@ -213,7 +221,8 @@ class ExoBatchGenerator:
         cache_snapshots: list[CacheSnapshot] = []
         remote_prefilled = False
         with vision_ctx:
-            if use_remote and task_params.prefill_endpoint is not None:
+            if prefill_mode == "remote":
+                assert task_params.prefill_endpoint is not None
                 try:
                     _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
                         prompt_tokens[:-1],
@@ -225,12 +234,20 @@ class ExoBatchGenerator:
                         start_pos=prefix_hit_length,
                     )
                     remote_prefilled = True
-                except Exception:
+                except Exception as exc:
+                    if require_remote_prefill:
+                        raise RemotePrefillRequired(
+                            "EXO_REQUIRE_REMOTE_PREFILL is set and remote prefill failed"
+                        ) from exc
                     logger.opt(exception=True).warning(
                         "Remote prefill failed, falling back to local prefill"
                     )
 
             if not remote_prefilled:
+                if require_remote_prefill:
+                    raise RemotePrefillRequired(
+                        "EXO_REQUIRE_REMOTE_PREFILL is set; refusing local prefill"
+                    )
                 _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
                     self.model,
                     self.tokenizer,
@@ -279,7 +296,9 @@ class ExoBatchGenerator:
                 prefill_tps=_prefill_tps,
             )
 
-        last_tokens = prompt_tokens[-2:]
+        materialize_cache_on_mlx_lm_generation_stream(cache)
+        logger.info(f"remote_prefilled={remote_prefilled}")
+        last_tokens = token_ids_from_prompt(prompt_tokens[-2:])
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
             make_logits_processors(
@@ -299,7 +318,7 @@ class ExoBatchGenerator:
         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
         uids = self._mlx_gen.insert(
-            prompts=[cast(list[int], last_tokens.tolist())],
+            prompts=[last_tokens],
             max_tokens=[max_tokens],
             caches=[list(cache)],
             samplers=[sampler],

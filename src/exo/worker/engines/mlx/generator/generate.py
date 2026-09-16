@@ -1,12 +1,14 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
-from typing import Callable, Generator, cast, get_args
+from typing import Callable, Generator, Literal, cast, final, get_args
 
 import mlx.core as mx
 from mlx_lm.generate import (
+    generation_stream as mlx_lm_generation_stream,
     maybe_quantize_kv_cache,
     stream_generate,
 )
@@ -78,6 +80,70 @@ REMOTE_PREFILL_MIN_TOKENS = 1000
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+_TRUTHY_ENVIRONMENT_VALUES = frozenset({"1", "true", "yes"})
+
+
+@final
+class RemotePrefillRequired(RuntimeError):
+    """Raised when EXO_REQUIRE_REMOTE_PREFILL forbids local Mac prefill.
+
+    The runner surfaces this as a failed generation task so a decode-only
+    Mac node never re-prefills the prompt on Metal.
+    """
+
+
+def environment_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENVIRONMENT_VALUES
+
+
+def remote_prefill_minimum_tokens() -> int:
+    raw = os.environ.get("EXO_REMOTE_PREFILL_MIN_TOKENS")
+    if raw is None or raw.strip() == "":
+        return REMOTE_PREFILL_MIN_TOKENS
+    return int(raw)
+
+
+def token_ids_from_prompt(tokens: mx.array | list[int]) -> list[int]:
+    if isinstance(tokens, mx.array):
+        return [int(token) for token in cast(list[int], tokens.tolist())]
+    return [int(token) for token in tokens]
+
+
+def resolve_prefill_mode(
+    uncached_token_count: int,
+    prefill_endpoint: str | None,
+    *,
+    require_remote: bool,
+    minimum_tokens: int,
+) -> Literal["remote", "local"]:
+    if require_remote:
+        if prefill_endpoint is None or prefill_endpoint.strip() == "":
+            raise RemotePrefillRequired(
+                "EXO_REQUIRE_REMOTE_PREFILL is set but task.prefill_endpoint is missing"
+            )
+        return "remote"
+    if uncached_token_count > minimum_tokens and prefill_endpoint is not None:
+        return "remote"
+    return "local"
+
+
+def materialize_cache_on_mlx_lm_generation_stream(cache: KVCacheType) -> None:
+    """Eval cache state on mlx_lm's stream before decode reuses it.
+
+    Remote-injected (and snapshot-copied) arrays can live on a different Metal
+    stream than mlx_lm `stream_generate`. Crossing those streams with
+    METAL_FAST_SYNCH=1 hangs in Fence::wait; eval+synchronize on the mlx_lm
+    generation stream detaches the graph first.
+    """
+    states: list[object] = []
+    for entry in cache:
+        state = getattr(entry, "state", None)
+        if state is not None:
+            states.append(state)
+    if states:
+        with mx.stream(mlx_lm_generation_stream):
+            mx.eval(states)
+    mx.synchronize()
 
 
 @contextlib.contextmanager
@@ -428,11 +494,13 @@ def prefill(
                     snapshots.append(snapshots[0])
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
-            # We just throw away the generated token - we only care about filling the cache
+            # We just throw away the generated token - we only care about filling the cache.
+            # Coerce mx.array prompts to list[int]: Metal hangs in stream_generate
+            # when the prompt tokens are still live graph arrays.
             for _ in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
-                prompt=prompt_tokens,
+                prompt=token_ids_from_prompt(prompt_tokens),
                 max_tokens=1,
                 sampler=sampler,
                 prompt_cache=cache,
@@ -482,6 +550,10 @@ def warmup_inference(
     group: mx.distributed.Group | None,
     model_id: ModelId,
 ) -> int:
+    if environment_flag_enabled("EXO_SKIP_WARMUP"):
+        logger.info("EXO_SKIP_WARMUP is set; skipping inference warmup")
+        return 50
+
     logger.info(f"warming up inference for instance: {model_id}")
 
     content = InputMessageContent(
@@ -717,16 +789,20 @@ def mlx_generate(
         if vision is not None
         else contextlib.nullcontext()
     )
-    use_remote = (
-        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
-        and task.prefill_endpoint is not None
+    require_remote_prefill = environment_flag_enabled("EXO_REQUIRE_REMOTE_PREFILL")
+    prefill_mode = resolve_prefill_mode(
+        len(prompt_tokens),
+        task.prefill_endpoint,
+        require_remote=require_remote_prefill,
+        minimum_tokens=remote_prefill_minimum_tokens(),
     )
     remote_prefilled = False
     prefill_tps = 0.0
     prefill_tokens = 0
     ssm_snapshots_list: list[CacheSnapshot] = []
     with maybe_vision_ctx:
-        if use_remote and task.prefill_endpoint is not None:
+        if prefill_mode == "remote":
+            assert task.prefill_endpoint is not None
             try:
                 prefill_tps, prefill_tokens, ssm_snapshots_list = remote_prefill(
                     prompt_tokens[:-1],
@@ -738,11 +814,19 @@ def mlx_generate(
                     start_pos=prefix_hit_length,
                 )
                 remote_prefilled = True
-            except Exception:
+            except Exception as exc:
+                if require_remote_prefill:
+                    raise RemotePrefillRequired(
+                        "EXO_REQUIRE_REMOTE_PREFILL is set and remote prefill failed"
+                    ) from exc
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
         if not remote_prefilled:
+            if require_remote_prefill:
+                raise RemotePrefillRequired(
+                    "EXO_REQUIRE_REMOTE_PREFILL is set; refusing local prefill"
+                )
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
@@ -786,8 +870,11 @@ def mlx_generate(
                 prefill_tps=prefill_tps,
             )
 
-    # stream_generate starts from the last token
-    last_token = prompt_tokens[-2:]
+    # Reuse remote/local caches for decode. Do not re-prefill the full prompt.
+    materialize_cache_on_mlx_lm_generation_stream(caches)
+    logger.info(f"remote_prefilled={remote_prefilled}")
+
+    last_token = token_ids_from_prompt(prompt_tokens[-2:])
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""

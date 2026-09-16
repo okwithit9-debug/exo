@@ -63,6 +63,10 @@ class CacheSnapshot:
 
 
 def _detached_copy(a: mx.array) -> mx.array:
+    # Materialize on the current stream before the numpy round-trip. SSM
+    # snapshot copies otherwise keep a live Metal Fence and hang decode.
+    mx.eval(a)
+    mx.synchronize()
     dtype = a.dtype
     if dtype == mx.bfloat16:
         return mx.array(np.array(a.astype(mx.float32))).astype(mx.bfloat16)
