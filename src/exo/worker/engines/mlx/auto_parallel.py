@@ -5,6 +5,7 @@ from inspect import signature
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
+import numpy as np
 import mlx.nn as nn
 from mlx.nn.layers.distributed import (
     shard_inplace,
@@ -233,39 +234,39 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            # Metal↔CUDA: GPU all_gather and Metal→CUDA send both hang.
-            # Move the final-hidden broadcast onto the CPU stream (same shape
-            # semantics as all_gather + take-last shard).
+            # Metal↔CUDA: GPU all_gather / Metal-backed send hang. Host-copy the
+            # final hidden, then CPU-stream send/recv (same take-last semantics).
             cpu = mx.default_stream(mx.Device(mx.cpu))
             if self.r == self.s - 1:
+                mx.eval(output)
+                mx.synchronize()
+                host = np.array(output)
+                out_cpu = mx.array(host)
                 for dst in range(self.s - 1):
                     print(
-                        f"[PP] decode broadcast send {self.r}->{dst} shape={getattr(output, 'shape', None)}",
+                        f"[PP] decode broadcast send {self.r}->{dst} shape={host.shape}",
                         flush=True,
                     )
                     logger.info(
-                        f"PP decode broadcast send {self.r}->{dst} shape={getattr(output, 'shape', None)}"
+                        f"PP decode broadcast send {self.r}->{dst} shape={host.shape}"
                     )
-                    # Materialize on CPU before distributed send.
-                    out_cpu = output
-                    mx.eval(out_cpu)
                     with mx.stream(cpu):
                         sent = mx.distributed.send(out_cpu, dst, group=self.group)
                         mx.eval(sent)
-                mx.synchronize()
             else:
                 src = self.s - 1
+                # Fresh CPU placeholder — do not reuse Metal activation graph.
+                placeholder = mx.zeros(output.shape, dtype=output.dtype)
                 print(
-                    f"[PP] decode broadcast recv {self.r}<-{src} shape={getattr(output, 'shape', None)}",
+                    f"[PP] decode broadcast recv {self.r}<-{src} shape={tuple(output.shape)}",
                     flush=True,
                 )
                 logger.info(
-                    f"PP decode broadcast recv {self.r}<-{src} shape={getattr(output, 'shape', None)}"
+                    f"PP decode broadcast recv {self.r}<-{src} shape={tuple(output.shape)}"
                 )
                 with mx.stream(cpu):
-                    output = mx.distributed.recv_like(output, src, group=self.group)
+                    output = mx.distributed.recv_like(placeholder, src, group=self.group)
                     mx.eval(output)
-                mx.synchronize()
 
         return output
 
