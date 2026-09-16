@@ -396,6 +396,13 @@ def prefill(
                 progress_callback(num_tokens, num_tokens)
                 print(f"[PP] short-prefill complete rank={rank}", flush=True)
                 logger.info(f"PP short-prefill complete rank={rank}")
+                # Short path does a single forward (no stream_generate +1/+1),
+                # so the post-prefill trim(2)/snapshots[-2] logic must not run.
+                set_pipeline_queue_sends(model, queue_sends=False)
+                set_pipeline_prefill(model, is_prefill=False)
+                elapsed = time.perf_counter() - start_time
+                tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
+                return tokens_per_sec, num_tokens, snapshots
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
             # We just throw away the generated token - we only care about filling the cache
@@ -422,7 +429,7 @@ def prefill(
 
     # stream_generate added 1 extra generated token to the cache, so we should trim it.
     # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
-    pre_gen = snapshots[-2] if has_ssm else None
+    pre_gen = snapshots[-2] if has_ssm and len(snapshots) >= 2 else None
     for i, c in enumerate(cache):
         non_trimmable = is_non_trimmable_cache_entry(c)
         if has_ssm and non_trimmable:
