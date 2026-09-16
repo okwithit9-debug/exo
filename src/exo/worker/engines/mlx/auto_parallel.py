@@ -238,6 +238,11 @@ class PipelineFirstLayer(CustomMlxLayer):
             logger.info(
                 f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
             )
+            # Detach from the distributed ring before Metal forward. Leaving the
+            # recv array wired into decode layers Fence::waits on this ring.
+            if not self.is_prefill:
+                x = mx.array(np.ascontiguousarray(np.array(x)))
+                print(f"[PP] recv detached host-copy rank={self.r}", flush=True)
         else:
             print(f"[PP] first-layer rank0 in={getattr(x, 'shape', None)}", flush=True)
         out = self.original_layer(x, *args, **kwargs)
@@ -298,7 +303,9 @@ class PipelineLastLayer(CustomMlxLayer):
                 mx.synchronize()
                 output = sent
                 logger.info(f"PP send: rank={self.r} completed")
-                if cache is not None:
+                # Skip mx.depends/eval on cache during decode — it keeps the
+                # Metal↔CUDA ring busy and Fence-deadlocks the peer forward.
+                if self.is_prefill and cache is not None:
                     _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
                     if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
                         _cache.keys = mx.depends(_cache.keys, output)  # type: ignore
