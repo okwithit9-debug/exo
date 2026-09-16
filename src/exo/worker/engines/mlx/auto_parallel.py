@@ -72,6 +72,15 @@ if TYPE_CHECKING:
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
 
 
+def _pp_barrier(group: mx.distributed.Group) -> None:
+    """CPU all_sum barrier — keep Metal↔CUDA peers out of all_gather until both finish local work."""
+    mx.eval(
+        mx.distributed.all_sum(
+            mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+        )
+    )
+
+
 def flush_prefill_sends() -> None:
     pending = list(_pending_prefill_sends)
     _pending_prefill_sends.clear()
@@ -224,10 +233,23 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
+            # Metal↔CUDA: if rank0 enters all_gather while rank1 is still in
+            # Metal forward, rank1 Fence::waits forever. Barrier first so both
+            # finish local send/forward, then gather.
+            print(
+                f"[PP] decode pre-all_gather barrier rank={self.r}/{self.s}",
+                flush=True,
+            )
+            logger.info(
+                f"PP decode pre-all_gather barrier rank={self.r}/{self.s}"
+            )
+            mx.synchronize()
+            _pp_barrier(self.group)
             output = mx.distributed.all_gather(output, group=self.group)[
                 -output.shape[0] :
             ]
             mx.eval(output)
+            mx.synchronize()
 
         return output
 
