@@ -155,6 +155,21 @@ def _tcp_broadcast_final_hidden(
 
 
 
+def _host_detach_array(arr: mx.array) -> mx.array:
+    """Materialize through float32 host memory to drop MLX-ring Fence deps."""
+    arr_f32 = arr.astype(mx.float32)
+    mx.eval(arr_f32)
+    mx.synchronize()
+    host = np.ascontiguousarray(np.array(arr_f32), dtype=np.float32)
+    out = mx.array(host)
+    try:
+        if arr.dtype != mx.float32:
+            out = out.astype(arr.dtype)
+    except Exception:
+        pass
+    return out
+
+
 def _tcp_send_array(peer: str, port: int, arr: mx.array) -> None:
     arr_f32 = arr.astype(mx.float32)
     mx.eval(arr_f32)
@@ -280,6 +295,13 @@ class PipelineFirstLayer(CustomMlxLayer):
                 port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
                 print(f"[PP] decode tcp-recv rank={self.r}", flush=True)
                 x = _tcp_recv_array(port)
+                try:
+                    x = x.astype(mx.bfloat16)
+                except Exception:
+                    try:
+                        x = x.astype(mx.float16)
+                    except Exception:
+                        pass
             else:
                 # Prefill (or no peer env): MLX ring recv.
                 if _os.environ.get("EXO_PP_SKIP_PRE_RECV_EVAL", "0") != "1":
@@ -296,6 +318,9 @@ class PipelineFirstLayer(CustomMlxLayer):
                 logger.info(
                     f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
                 )
+                # Drop ring Fence deps before Metal forward / KV writes.
+                x = _host_detach_array(x)
+                print(f"[PP] recv host-detached rank={self.r}", flush=True)
         else:
             print(f"[PP] first-layer rank0 in={getattr(x, 'shape', None)}", flush=True)
         out = self.original_layer(x, *args, **kwargs)
@@ -335,6 +360,10 @@ class PipelineLastLayer(CustomMlxLayer):
             f"queue={self.queue_sends} in_shape={getattr(x, 'shape', None)}"
         )
         output: mx.array = self.original_layer(x, *args, **kwargs)
+        print(
+            f"[PP] last-layer original done rank={self.r} prefill={self.is_prefill}",
+            flush=True,
+        )
 
         if self.r != self.s - 1:
             import os as _os
