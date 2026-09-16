@@ -153,6 +153,59 @@ def _tcp_broadcast_final_hidden(
 
 
 
+
+def _tcp_send_array(peer: str, port: int, arr: mx.array) -> None:
+    mx.eval(arr)
+    mx.synchronize()
+    host = np.ascontiguousarray(np.array(arr), dtype=np.float32)
+    shape = host.shape
+    payload = host.tobytes()
+    header = struct.pack("!I", len(shape)) + struct.pack("!" + "I" * len(shape), *shape)
+    header += struct.pack("!I", len(payload))
+    deadline = __import__("time").time() + 60
+    last_err: Exception | None = None
+    while __import__("time").time() < deadline:
+        try:
+            with socket.create_connection((peer, port), timeout=2.0) as sock:
+                sock.sendall(header)
+                sock.sendall(payload)
+            print(f"[PP] tcp act send -> {peer}:{port} shape={shape}", flush=True)
+            return
+        except OSError as e:
+            last_err = e
+            __import__("time").sleep(0.05)
+    assert last_err is not None
+    raise last_err
+
+
+def _tcp_recv_array(port: int) -> mx.array:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(1)
+    srv.settimeout(120.0)
+    print(f"[PP] tcp act recv listening :{port}", flush=True)
+    conn, _addr = srv.accept()
+    with conn:
+        def recvn(n: int) -> bytes:
+            buf = b""
+            while len(buf) < n:
+                chunk = conn.recv(n - len(buf))
+                if not chunk:
+                    raise RuntimeError("tcp act recv closed early")
+                buf += chunk
+            return buf
+
+        ndim = struct.unpack("!I", recvn(4))[0]
+        shape = struct.unpack("!" + "I" * ndim, recvn(4 * ndim))
+        nbytes = struct.unpack("!I", recvn(4))[0]
+        payload = recvn(nbytes)
+    srv.close()
+    host = np.frombuffer(payload, dtype=np.float32).reshape(shape).copy()
+    print(f"[PP] tcp act recv shape={shape}", flush=True)
+    return mx.array(host)
+
+
 def flush_prefill_sends() -> None:
     pending = list(_pending_prefill_sends)
     _pending_prefill_sends.clear()
@@ -219,30 +272,28 @@ class PipelineFirstLayer(CustomMlxLayer):
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         if self.r != 0:
-            # We want to avoid GPU timeout errors by evalling the distributed operation
-            # so that it stays on CPU, which does not have a timeout.
-            # Metal↔CUDA decode: evaluating the placeholder while the peer is still
-            # in forward/send Fence::waits forever — skip when EXO_PP_SKIP_PRE_RECV_EVAL=1.
             import os as _os
-            if _os.environ.get("EXO_PP_SKIP_PRE_RECV_EVAL", "0") != "1":
+            # Decode: TCP activation transfer — avoids Metal↔CUDA MLX recv/detach Fence.
+            if not self.is_prefill and _os.environ.get("EXO_PP_PEER_IP", "").strip():
+                port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
+                print(f"[PP] decode tcp-recv rank={self.r}", flush=True)
+                x = _tcp_recv_array(port)
+            else:
+                # Prefill (or no peer env): MLX ring recv.
+                if _os.environ.get("EXO_PP_SKIP_PRE_RECV_EVAL", "0") != "1":
+                    mx.eval(x)
+                    mx.synchronize()
+                print(f"[PP] recv waiting rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
+                logger.info(
+                    f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
+                )
+                x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
                 mx.eval(x)
                 mx.synchronize()
-            print(f"[PP] recv waiting rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
-            logger.info(
-                f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
-            )
-            x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
-            mx.eval(x)
-            mx.synchronize()
-            print(f"[PP] recv got rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
-            logger.info(
-                f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
-            )
-            # Detach from the distributed ring before Metal forward. Leaving the
-            # recv array wired into decode layers Fence::waits on this ring.
-            if not self.is_prefill:
-                x = mx.array(np.ascontiguousarray(np.array(x)))
-                print(f"[PP] recv detached host-copy rank={self.r}", flush=True)
+                print(f"[PP] recv got rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
+                logger.info(
+                    f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
+                )
         else:
             print(f"[PP] first-layer rank0 in={getattr(x, 'shape', None)}", flush=True)
         out = self.original_layer(x, *args, **kwargs)
@@ -284,13 +335,19 @@ class PipelineLastLayer(CustomMlxLayer):
         output: mx.array = self.original_layer(x, *args, **kwargs)
 
         if self.r != self.s - 1:
+            import os as _os
+            peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
             if self.queue_sends:
-                # Defer send+eval until flush_prefill_sends() so rank0 can finish
-                # the forward while rank1 is blocked in recv (Metal↔CUDA).
+                # Prefill: defer MLX send until flush_prefill_sends().
                 _pending_prefill_sends.append(
                     (output, (self.r + 1) % self.s, self.group)
                 )
                 print(f"[PP] queued send rank={self.r} pending={len(_pending_prefill_sends)}", flush=True)
+            elif (not self.is_prefill) and peer:
+                # Decode: TCP activation to next rank (no MLX send / Fence).
+                act_port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
+                print(f"[PP] decode tcp-send rank={self.r} -> {peer}:{act_port}", flush=True)
+                _tcp_send_array(peer, act_port, output)
             else:
                 logger.info(
                     f"PP send: rank={self.r} -> {(self.r + 1) % self.s} shape={getattr(output, 'shape', None)}"
@@ -303,8 +360,6 @@ class PipelineLastLayer(CustomMlxLayer):
                 mx.synchronize()
                 output = sent
                 logger.info(f"PP send: rank={self.r} completed")
-                # Skip mx.depends/eval on cache during decode — it keeps the
-                # Metal↔CUDA ring busy and Fence-deadlocks the peer forward.
                 if self.is_prefill and cache is not None:
                     _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
                     if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
@@ -312,8 +367,7 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            # Metal↔CUDA MLX reverse send/all_gather hang. TCP broadcast of the
-            # final hidden gives the same take-last semantics without MLX.
+            # Final hidden to earlier ranks over TCP (no MLX reverse send/all_gather).
             output = _tcp_broadcast_final_hidden(self.r, self.s, output)
 
         return output
