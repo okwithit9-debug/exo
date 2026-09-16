@@ -393,16 +393,31 @@ def prefill(
                 mx.synchronize()
                 if distributed_prompt_progress_callback is not None:
                     distributed_prompt_progress_callback()
+                # Snapshot once at true prompt length (before +2 overhang).
                 progress_callback(num_tokens, num_tokens)
+                # Match pipeline_parallel_prefill / stream_generate: process
+                # prompt[-1:] twice so shared trim(2) + last_token=prompt[-2:]
+                # decode path stays consistent (avoids inline-send decode deadlock).
+                for step in range(2):
+                    print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
+                    if rank == 0:
+                        model(tokens[-1:][None], cache=cache)
+                        mx.synchronize()
+                    mx_barrier(group)
+                    if rank == 0:
+                        flush_prefill_sends()
+                        mx.synchronize()
+                    else:
+                        model(tokens[-1:][None], cache=cache)
+                        flush_prefill_sends()
+                        mx.synchronize()
+                    mx_barrier(group)
                 print(f"[PP] short-prefill complete rank={rank}", flush=True)
                 logger.info(f"PP short-prefill complete rank={rank}")
-                # Short path does a single forward (no stream_generate +1/+1),
-                # so the post-prefill trim(2)/snapshots[-2] logic must not run.
-                set_pipeline_queue_sends(model, queue_sends=False)
-                set_pipeline_prefill(model, is_prefill=False)
-                elapsed = time.perf_counter() - start_time
-                tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0.0
-                return tokens_per_sec, num_tokens, snapshots
+                # Fall through to shared trim(2). For SSM, snapshots[-2] needs
+                # >=2 entries — pad with the prompt-length snapshot.
+                if has_ssm and len(snapshots) == 1:
+                    snapshots.append(snapshots[0])
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
             # We just throw away the generated token - we only care about filling the cache
