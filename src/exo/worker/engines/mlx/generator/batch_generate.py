@@ -34,7 +34,7 @@ from exo.worker.engines.mlx.cache import (
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
-    RemotePrefillRequired,
+    RemotePrefillRequiredError,
     ban_token_ids,
     environment_flag_enabled,
     eos_ids_from_tokenizer,
@@ -236,7 +236,7 @@ class ExoBatchGenerator:
                     remote_prefilled = True
                 except Exception as exc:
                     if require_remote_prefill:
-                        raise RemotePrefillRequired(
+                        raise RemotePrefillRequiredError(
                             "EXO_REQUIRE_REMOTE_PREFILL is set and remote prefill failed"
                         ) from exc
                     logger.opt(exception=True).warning(
@@ -245,7 +245,7 @@ class ExoBatchGenerator:
 
             if not remote_prefilled:
                 if require_remote_prefill:
-                    raise RemotePrefillRequired(
+                    raise RemotePrefillRequiredError(
                         "EXO_REQUIRE_REMOTE_PREFILL is set; refusing local prefill"
                     )
                 _prefill_tps, _prefill_tokens, cache_snapshots = prefill(

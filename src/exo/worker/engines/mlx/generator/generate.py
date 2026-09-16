@@ -9,6 +9,8 @@ from typing import Callable, Generator, Literal, cast, final, get_args
 import mlx.core as mx
 from mlx_lm.generate import (
     generation_stream as mlx_lm_generation_stream,
+)
+from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
 )
@@ -37,10 +39,10 @@ from exo.worker.engines.mlx.auto_parallel import (
     PipelineFirstLayer,
     PipelineLastLayer,
     clear_prefill_sends,
+    detach_pipeline_kv_cache,
     flush_prefill_sends,
     set_pipeline_prefill,
     set_pipeline_queue_sends,
-    detach_pipeline_kv_cache,
 )
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
@@ -84,7 +86,7 @@ _TRUTHY_ENVIRONMENT_VALUES = frozenset({"1", "true", "yes"})
 
 
 @final
-class RemotePrefillRequired(RuntimeError):
+class RemotePrefillRequiredError(RuntimeError):
     """Raised when EXO_REQUIRE_REMOTE_PREFILL forbids local Mac prefill.
 
     The runner surfaces this as a failed generation task so a decode-only
@@ -118,7 +120,7 @@ def resolve_prefill_mode(
 ) -> Literal["remote", "local"]:
     if require_remote:
         if prefill_endpoint is None or prefill_endpoint.strip() == "":
-            raise RemotePrefillRequired(
+            raise RemotePrefillRequiredError(
                 "EXO_REQUIRE_REMOTE_PREFILL is set but task.prefill_endpoint is missing"
             )
         return "remote"
@@ -135,14 +137,12 @@ def materialize_cache_on_mlx_lm_generation_stream(cache: KVCacheType) -> None:
     METAL_FAST_SYNCH=1 hangs in Fence::wait; eval+synchronize on the mlx_lm
     generation stream detaches the graph first.
     """
-    states: list[object] = []
-    for entry in cache:
-        state = getattr(entry, "state", None)
-        if state is not None:
-            states.append(state)
+    states = [
+        entry.state for entry in cache if getattr(entry, "state", None) is not None
+    ]
     if states:
         with mx.stream(mlx_lm_generation_stream):
-            mx.eval(states)
+            mx.eval(states)  # type: ignore[arg-type]
     mx.synchronize()
 
 
@@ -423,6 +423,7 @@ def prefill(
                 # Metal↔CUDA: use TCP activations (see auto_parallel). Both ranks
                 # must call model() together so rank1 can accept while rank0 sends.
                 import os as _os
+
                 tokens = (
                     prompt_tokens
                     if isinstance(prompt_tokens, mx.array)
@@ -430,8 +431,13 @@ def prefill(
                 )
                 rank = group.rank()
                 peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
-                print(f"[PP] short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}", flush=True)
-                logger.info(f"PP short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}")
+                print(
+                    f"[PP] short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}",
+                    flush=True,
+                )
+                logger.info(
+                    f"PP short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}"
+                )
 
                 def _step(tok):
                     mx_barrier(group)
@@ -444,7 +450,10 @@ def prefill(
                     _step(tokens)
                     progress_callback(num_tokens, num_tokens)
                     for step in range(2):
-                        print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
+                        print(
+                            f"[PP] short-prefill overhang step={step} rank={rank}",
+                            flush=True,
+                        )
                         _step(tokens[-1:])
                 else:
                     # Homogeneous MLX ring: keep serial queue/flush path.
@@ -462,7 +471,10 @@ def prefill(
                     mx_barrier(group)
                     progress_callback(num_tokens, num_tokens)
                     for step in range(2):
-                        print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
+                        print(
+                            f"[PP] short-prefill overhang step={step} rank={rank}",
+                            flush=True,
+                        )
                         if rank == 0:
                             model(tokens[-1:][None], cache=cache)
                             mx.synchronize()
@@ -816,7 +828,7 @@ def mlx_generate(
                 remote_prefilled = True
             except Exception as exc:
                 if require_remote_prefill:
-                    raise RemotePrefillRequired(
+                    raise RemotePrefillRequiredError(
                         "EXO_REQUIRE_REMOTE_PREFILL is set and remote prefill failed"
                     ) from exc
                 logger.opt(exception=True).warning(
@@ -824,7 +836,7 @@ def mlx_generate(
                 )
         if not remote_prefilled:
             if require_remote_prefill:
-                raise RemotePrefillRequired(
+                raise RemotePrefillRequiredError(
                     "EXO_REQUIRE_REMOTE_PREFILL is set; refusing local prefill"
                 )
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(

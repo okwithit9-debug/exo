@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 from typing import cast
 from unittest.mock import patch
 
@@ -8,7 +9,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.types.common import ModelId
 from exo.worker.engines.mlx.cache import _detached_copy
 from exo.worker.engines.mlx.generator.generate import (
-    RemotePrefillRequired,
+    RemotePrefillRequiredError,
     environment_flag_enabled,
     remote_prefill_minimum_tokens,
     resolve_prefill_mode,
@@ -67,7 +68,7 @@ def test_resolve_prefill_mode_default_threshold() -> None:
 
 
 def test_resolve_prefill_mode_requires_endpoint() -> None:
-    with pytest.raises(RemotePrefillRequired, match="prefill_endpoint is missing"):
+    with pytest.raises(RemotePrefillRequiredError, match="prefill_endpoint is missing"):
         resolve_prefill_mode(
             2,
             None,
