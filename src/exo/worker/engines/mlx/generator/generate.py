@@ -355,7 +355,10 @@ def prefill(
             else:
                 # Metal↔CUDA: Qwen4 PLE does mx.eval mid-forward. If rank1 has
                 # already posted recv, those evals Fence::wait forever.
-                # Serial stages: rank0 forward+flush first, barrier, then rank1.
+                # Serial: rank0 completes forward (queues send) before barrier.
+                # Flush AFTER barrier, concurrent with rank1 recv — flushing
+                # before barrier deadlocks because mx.distributed.send/eval
+                # waits for the peer recv that rank1 only posts post-barrier.
                 tokens = (
                     prompt_tokens
                     if isinstance(prompt_tokens, mx.array)
@@ -366,12 +369,14 @@ def prefill(
                 logger.info(f"PP short-prefill serial rank={rank} tokens={num_tokens}")
                 if rank == 0:
                     model(tokens[None], cache=cache)
-                    print("[PP] rank0 model done; flushing send", flush=True)
+                    mx.synchronize()
+                    print("[PP] rank0 model done; barrier then flush", flush=True)
+                mx_barrier(group)
+                if rank == 0:
+                    print("[PP] rank0 post-barrier flush", flush=True)
                     flush_prefill_sends()
                     mx.synchronize()
-                    print("[PP] rank0 flush done; barrier", flush=True)
-                mx_barrier(group)
-                if rank != 0:
+                else:
                     print("[PP] rank1 post-barrier model/recv", flush=True)
                     model(tokens[None], cache=cache)
                     print("[PP] rank1 model done", flush=True)

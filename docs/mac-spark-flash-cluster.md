@@ -29,6 +29,6 @@ LoadModel with Mac rank0 / Spark rank1 works. First warmup prefill over Metal↔
 
 ## Prefill / PLE notes (2026-09-15)
 
-- Short pipeline warmup uses **serial stages** (rank0 forward+flush, barrier, then rank1) so Qwen4 PLE `mx.eval` mid-forward does not Fence-deadlock against a posted PP recv.
+- Short pipeline warmup uses **serial stages** (rank0 forward+queue, barrier, then rank0 flush concurrent with rank1 recv) so Qwen4 PLE `mx.eval` mid-forward does not Fence-deadlock against a posted PP recv, and flush does not deadlock waiting for that recv.
 - PLE ngram weights are ~**111GB** on disk (`ShardedEmbedding`, `split_ngram_parts=128`). Do **not** `mx.eval` those shard params at load — leave them lazy and gather touched rows only.
 - After a thrash, macOS may leave **~100GB+ wired Metal** with no process holding it; reboot (or long wait) to reclaim before `place_instance` can find cycles.

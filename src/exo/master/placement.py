@@ -251,10 +251,16 @@ def place_instance(
             }
         )
 
-    # EXO_METAL_RANK0: put Metal node as rank0 when paired with Cuda.
-    # Spark CUDA OOMs on early-layer packs (~115GB+ safetensors); Metal lazy-loads.
-    # Spark then takes late layers (~40GB) as rank1.
-    if command.sharding == Sharding.Pipeline and node_backends:
+    # EXO_METAL_RANK0=1 (default): Metal rank0 / Cuda rank1 — needed for huge early
+    # packs (Flash PLE) where Spark CUDA OOMs. EXO_METAL_RANK0=0: leave cycle order
+    # (prefer Cuda/Spark first when the placer put it first) for Spark-prefill on
+    # smaller models like 27B.
+    import os as _os
+    if (
+        command.sharding == Sharding.Pipeline
+        and node_backends
+        and _os.environ.get("EXO_METAL_RANK0", "1") == "1"
+    ):
         metal_nodes = [
             n for n in selected_cycle.node_ids
             if Backend.MlxMetal in (node_backends.get(n) or [])
@@ -271,6 +277,29 @@ def place_instance(
                 if n not in metal_nodes and n not in cuda_nodes
             ]
             new_order = list(metal_nodes) + rest + list(cuda_nodes)
+            if list(selected_cycle.node_ids) != new_order:
+                selected_cycle = Cycle(node_ids=new_order)
+    elif (
+        command.sharding == Sharding.Pipeline
+        and node_backends
+        and _os.environ.get("EXO_CUDA_RANK0", "0") == "1"
+    ):
+        metal_nodes = [
+            n for n in selected_cycle.node_ids
+            if Backend.MlxMetal in (node_backends.get(n) or [])
+        ]
+        cuda_nodes = [
+            n for n in selected_cycle.node_ids
+            if Backend.MlxCuda in (node_backends.get(n) or [])
+            and n not in metal_nodes
+        ]
+        if metal_nodes and cuda_nodes:
+            rest = [
+                n
+                for n in selected_cycle.node_ids
+                if n not in metal_nodes and n not in cuda_nodes
+            ]
+            new_order = list(cuda_nodes) + rest + list(metal_nodes)
             if list(selected_cycle.node_ids) != new_order:
                 selected_cycle = Cycle(node_ids=new_order)
 
