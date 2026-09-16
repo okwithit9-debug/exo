@@ -72,7 +72,9 @@ from exo.worker.engines.mlx.vision import (
 )
 from exo.worker.runner.bootstrap import logger
 
-REMOTE_PREFILL_MIN_TOKENS = 1000
+REMOTE_PREFILL_MIN_TOKENS = int(
+    __import__("os").environ.get("EXO_REMOTE_PREFILL_MIN_TOKENS", "1000")
+)
 
 generation_stream = mx.new_stream(mx.default_device())
 
@@ -402,6 +404,14 @@ def warmup_inference(
     group: mx.distributed.Group | None,
     model_id: ModelId,
 ) -> int:
+    import os as _os
+    if _os.environ.get("EXO_SKIP_WARMUP", "").strip().lower() in {"1", "true", "yes"}:
+        # Mac Qwen3.8-27B hangs in mlx::core::Fence::wait during StartWarmup
+        # prefill even for worldSize=1; skip so RunnerReady is reachable.
+        logger.warning(
+            f"EXO_SKIP_WARMUP set — skipping warmup_inference for {model_id}"
+        )
+        return 50
     logger.info(f"warming up inference for instance: {model_id}")
 
     content = InputMessageContent(

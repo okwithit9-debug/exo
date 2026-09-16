@@ -281,7 +281,17 @@ class Runner:
                 self.update_status(RunnerWarmingUp())
                 self.acknowledge_task(task)
 
-                self.generator.warmup()
+                import os as _os
+                if _os.environ.get("EXO_SKIP_WARMUP", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }:
+                    logger.warning(
+                        "EXO_SKIP_WARMUP set — skipping generator.warmup()"
+                    )
+                else:
+                    self.generator.warmup()
 
                 logger.info(
                     f"runner initialized in {time.time() - self.setup_start_time} seconds"

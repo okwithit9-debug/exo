@@ -59,7 +59,9 @@ from exo.worker.engines.mlx.vision import (
 from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
-REMOTE_PREFILL_MIN_TOKENS = 1000
+REMOTE_PREFILL_MIN_TOKENS = int(
+    __import__("os").environ.get("EXO_REMOTE_PREFILL_MIN_TOKENS", "1000")
+)
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
