@@ -97,9 +97,17 @@ def _tcp_broadcast_final_hidden(
         raise RuntimeError("EXO_PP_PEER_IP is required for PP decode broadcast")
 
     if rank == world - 1:
-        out_f32 = output.astype(mx.float32)
+        print(f"[PP] tcp broadcast eval begin rank={rank} shape={getattr(output, 'shape', None)} dtype={getattr(output, 'dtype', None)}", flush=True)
+        try:
+            detached = mx.stop_gradient(output)
+        except Exception:
+            detached = output
+        # Contiguous + float32 on default device, then host round-trip.
+        out_f32 = mx.contiguous(detached.astype(mx.float32))
+        print("[PP] tcp broadcast calling mx.eval", flush=True)
         mx.eval(out_f32)
         mx.synchronize()
+        print(f"[PP] tcp broadcast eval done rank={rank}", flush=True)
         host = np.ascontiguousarray(np.array(out_f32), dtype=np.float32)
         shape = host.shape
         payload = host.tobytes()
@@ -126,6 +134,11 @@ def _tcp_broadcast_final_hidden(
         return output
 
     # Earlier ranks: listen, accept one connection from last rank.
+    # Brief pause so last-rank can start mx.eval while our ring threads stay
+    # in SocketThread::worker rather than blocked only on accept (belt+suspenders).
+    pause = float(__import__("os").environ.get("EXO_PP_DECODE_EVAL_PAUSE", "0.05"))
+    if pause > 0:
+        __import__("time").sleep(pause)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
@@ -402,6 +415,38 @@ class PipelineLastLayer(CustomMlxLayer):
             output = _tcp_broadcast_final_hidden(self.r, self.s, output)
 
         return output
+
+
+
+def detach_pipeline_kv_cache(cache) -> None:
+    """Host-copy KV entries so decode does not Fence on prefill ring edges."""
+    import os as _os
+    if not _os.environ.get("EXO_PP_PEER_IP", "").strip():
+        return
+    if not cache:
+        return
+    print("[PP] detach_pipeline_kv_cache begin", flush=True)
+    n = 0
+    for c in cache:
+        keys = getattr(c, "keys", None)
+        values = getattr(c, "values", None)
+        if keys is None:
+            continue
+        def _one(a):
+            if a is None:
+                return None
+            if isinstance(a, (list, tuple)):
+                return type(a)(_one(x) for x in a)
+            return _host_detach_array(a)
+        try:
+            c.keys = _one(keys)
+            if values is not None:
+                c.values = _one(values)
+            n += 1
+        except Exception as e:
+            print(f"[PP] detach_pipeline_kv_cache skip entry: {e}", flush=True)
+    mx.synchronize()
+    print(f"[PP] detach_pipeline_kv_cache done n={n}", flush=True)
 
 
 def set_pipeline_prefill(model: nn.Module, is_prefill: bool) -> None:

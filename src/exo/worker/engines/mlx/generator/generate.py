@@ -38,6 +38,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     flush_prefill_sends,
     set_pipeline_prefill,
     set_pipeline_queue_sends,
+    detach_pipeline_kv_cache,
 )
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
@@ -441,6 +442,8 @@ def prefill(
 
     set_pipeline_queue_sends(model, queue_sends=False)
     set_pipeline_prefill(model, is_prefill=False)
+    # Break any residual ring Fence edges in KV before decode TCP path.
+    detach_pipeline_kv_cache(cache)
 
     # stream_generate added 1 extra generated token to the cache, so we should trim it.
     # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
