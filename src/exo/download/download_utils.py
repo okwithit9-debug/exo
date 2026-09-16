@@ -808,13 +808,17 @@ def calculate_repo_progress(
 async def get_weight_map(model_id: ModelId, revision: str = "main") -> dict[str, str]:
     target_dir = await resolve_model_dir(model_id)
 
-    index_files_dir = snapshot_download(
-        repo_id=model_id,
-        local_dir=target_dir,
-        allow_patterns="*.safetensors.index.json",
-    )
-
-    index_files = list(Path(index_files_dir).glob("**/*.safetensors.index.json"))
+    # Prefer already-local index files (hardlinked HF cache paths break snapshot_download copy).
+    # Root index only — multi-quant repos also ship 6-bit/8-bit indexes that must not merge in.
+    index_files = list(Path(target_dir).glob("*.safetensors.index.json"))
+    if not index_files:
+        index_files_dir = snapshot_download(
+            repo_id=model_id,
+            local_dir=target_dir,
+            allow_patterns="*.safetensors.index.json",
+        )
+        index_files = list(Path(index_files_dir).glob("**/*.safetensors.index.json"))
+    index_files_dir = str(target_dir)
 
     weight_map: dict[str, str] = {}
 
@@ -833,17 +837,16 @@ async def get_weight_map(model_id: ModelId, revision: str = "main") -> dict[str,
             else:
                 weight_map = weight_map | index_data.weight_map
 
+    # Keep only root-quant weight files (drop 6-bit/8-bit/mtp paths).
+    weight_map = {k: v for k, v in weight_map.items() if "/" not in v}
     return weight_map
 
 
 async def resolve_allow_patterns(shard: ShardMetadata) -> list[str]:
-    # TODO: 'Smart' downloads are disabled because:
-    #  (i) We don't handle all kinds of files;
-    # (ii) We don't have sticky sessions.
-    # (iii) Tensor parallel requires all files.
-    return ["*"]
+    # Smart downloads re-enabled for Pipeline (local 4-bit packs).
+    # Previous hard return ["*"] pulled every quant folder (6-bit/8-bit) from multi-quant repos.
     try:
-        weight_map = await get_weight_map(str(shard.model_card.model_id))
+        weight_map = await get_weight_map(shard.model_card.model_id)
         return get_allow_patterns(weight_map, shard)
     except Exception:
         logger.error(f"Error getting weight map for {shard.model_card.model_id=}")

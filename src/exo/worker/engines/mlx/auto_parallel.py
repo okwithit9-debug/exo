@@ -133,9 +133,19 @@ class PipelineFirstLayer(CustomMlxLayer):
         if self.r != 0:
             # We want to avoid GPU timeout errors by evalling the distributed operation
             # so that it stays on CPU, which does not have a timeout.
+            # Metal↔CUDA rings also need an explicit synchronize or the peer can
+            # spin forever while this side sits in Fence::wait.
             mx.eval(x)
+            mx.synchronize()
+            logger.info(
+                f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
+            )
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
             mx.eval(x)
+            mx.synchronize()
+            logger.info(
+                f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
+            )
         return self.original_layer(x, *args, **kwargs)
 
 
@@ -165,6 +175,7 @@ class PipelineLastLayer(CustomMlxLayer):
         # Eval layer output to materialize it before send — this splits the graph
         # so the send is isolated and the receiving rank's recv can complete.
         mx.eval(output)
+        mx.synchronize()
 
         if self.r != self.s - 1:
             if self.queue_sends:
@@ -172,6 +183,9 @@ class PipelineLastLayer(CustomMlxLayer):
                     (output, (self.r + 1) % self.s, self.group)
                 )
             else:
+                logger.info(
+                    f"PP send: rank={self.r} -> {(self.r + 1) % self.s} shape={getattr(output, 'shape', None)}"
+                )
                 output = mx.distributed.send(
                     output, (self.r + 1) % self.s, group=self.group
                 )
@@ -182,8 +196,10 @@ class PipelineLastLayer(CustomMlxLayer):
                 if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
                     _cache.keys = mx.depends(_cache.keys, output)  # type: ignore
             mx.eval(output)
+            mx.synchronize()
             if cache is not None and hasattr(_cache, "keys"):  # type: ignore
                 mx.eval(_cache.keys)  # type: ignore
+            logger.info(f"PP send: rank={self.r} completed")
 
         if not self.is_prefill:
             output = mx.distributed.all_gather(output, group=self.group)[
@@ -294,6 +310,15 @@ def pipeline_auto_parallel(
     device_rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
 
     layers = layers[start_layer:end_layer]
+    # EXO_SHARD_BEFORE_EVAL: drop non-shard layer refs before mx.eval so CUDA/unified
+    # memory is not holding the full 175GB graph while materializing this shard.
+    _set_layers(model, layers)
+    import gc as _gc
+    _gc.collect()
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass
     total = len(layers)
     for i, layer in enumerate(layers):
         mx.eval(layer)  # type: ignore
@@ -355,6 +380,47 @@ def pipeline_auto_parallel(
                 ssm_idx=inner_model_instance.ssm_idx,
                 has_linear=bool(linear_layers),
             )
+
+
+    # EXO_Qwen4_HYBRID_FA_IDX: mlx_vlm qwen4_exp / qwen3_5 inner models are NOT
+    # instances of mlx_lm's Qwen3_5TextModel, so the block above skips them.
+    # After PP sharding, fa_idx/ssm_idx must be recomputed in the shard's local
+    # layer indices or mask/rope hit ArraysCache and Metal↔CUDA stalls.
+    if hasattr(inner_model_instance, "fa_idx") and hasattr(inner_model_instance, "ssm_idx"):
+        sample = layers[0] if layers else None
+        if sample is not None and hasattr(sample, "is_linear"):
+            full_attn_layers = [
+                i for i, layer in enumerate(layers) if not getattr(layer, "is_linear", True)
+            ]
+            linear_layers = [
+                i for i, layer in enumerate(layers) if getattr(layer, "is_linear", False)
+            ]
+            new_fa = full_attn_layers[0] if full_attn_layers else 0
+            new_ssm = linear_layers[0] if linear_layers else 0
+            if (
+                getattr(inner_model_instance, "fa_idx", None) != new_fa
+                or getattr(inner_model_instance, "ssm_idx", None) != new_ssm
+            ):
+                logger.info(
+                    f"EXO_Qwen4_HYBRID_FA_IDX: fa_idx {getattr(inner_model_instance, 'fa_idx', None)}->{new_fa} "
+                    f"ssm_idx {getattr(inner_model_instance, 'ssm_idx', None)}->{new_ssm} "
+                    f"(full={len(full_attn_layers)} linear={len(linear_layers)})"
+                )
+            inner_model_instance.fa_idx = new_fa
+            inner_model_instance.ssm_idx = new_ssm
+            if not full_attn_layers or not linear_layers:
+                try:
+                    _patch_hybrid_cache(
+                        cast(Qwen3_5TextModel | Qwen3NextModel, model),
+                        fa_idx=inner_model_instance.fa_idx,
+                        has_full_attn=bool(full_attn_layers),
+                        ssm_idx=inner_model_instance.ssm_idx,
+                        has_linear=bool(linear_layers),
+                    )
+                except Exception as e:
+                    logger.opt(exception=e).warning(
+                        "EXO_Qwen4_HYBRID_FA_IDX: _patch_hybrid_cache skipped"
+                    )
 
     if isinstance(inner_model_instance, NemotronHInnerModel):
         # NemotronH uses block_type: "M" (Mamba/SSM), "*" (Attention), "E" (MoE), "-" (MLP)

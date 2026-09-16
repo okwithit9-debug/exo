@@ -251,6 +251,29 @@ def place_instance(
             }
         )
 
+    # EXO_METAL_RANK0: put Metal node as rank0 when paired with Cuda.
+    # Spark CUDA OOMs on early-layer packs (~115GB+ safetensors); Metal lazy-loads.
+    # Spark then takes late layers (~40GB) as rank1.
+    if command.sharding == Sharding.Pipeline and node_backends:
+        metal_nodes = [
+            n for n in selected_cycle.node_ids
+            if Backend.MlxMetal in (node_backends.get(n) or [])
+        ]
+        cuda_nodes = [
+            n for n in selected_cycle.node_ids
+            if Backend.MlxCuda in (node_backends.get(n) or [])
+            and n not in metal_nodes
+        ]
+        if metal_nodes and cuda_nodes:
+            rest = [
+                n
+                for n in selected_cycle.node_ids
+                if n not in metal_nodes and n not in cuda_nodes
+            ]
+            new_order = list(metal_nodes) + rest + list(cuda_nodes)
+            if list(selected_cycle.node_ids) != new_order:
+                selected_cycle = Cycle(node_ids=new_order)
+
     shard_assignments = get_shard_assignments(
         command.model_card, selected_cycle, command.sharding, node_memory
     )

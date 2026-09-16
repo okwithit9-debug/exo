@@ -99,6 +99,9 @@ def _allocate_and_validate_layers(
     total_memory: Memory,
     model_card: ModelCard,
 ) -> list[int]:
+    # Cap any single node's share so CUDA/MLX overhead cannot OOM the largest node
+    # (Spark previously OOMed at 28/48 ≈ 58% of a 175GB Flash pack).
+    EXO_MAX_LAYER_FRAC = 0.45
     layer_allocations = allocate_layers_proportionally(
         total_layers=model_card.n_layers,
         memory_fractions=[
@@ -108,6 +111,32 @@ def _allocate_and_validate_layers(
 
     total_storage = model_card.storage_size
     total_layers = model_card.n_layers
+    max_layers = max(1, int(total_layers * EXO_MAX_LAYER_FRAC))
+    # Rebalance: move surplus layers from over-cap nodes to the node with most spare RAM
+    guard = 0
+    while max(layer_allocations) > max_layers and guard < total_layers:
+        guard += 1
+        donor = max(range(len(layer_allocations)), key=lambda i: layer_allocations[i])
+        # recipient = most spare after +1 layer
+        def spare(j: int) -> int:
+            req = (total_storage * (layer_allocations[j] + (0 if j != donor else -1) + (1 if j != donor else 0))) // total_layers
+            # compute spare for taking one more from donor
+            take = layer_allocations[j] + 1
+            req_take = (total_storage * take) // total_layers
+            return node_memory[node_ids[j]].ram_available.in_bytes - req_take.in_bytes
+        recipients = [j for j in range(len(layer_allocations)) if j != donor]
+        if not recipients:
+            break
+        recip = max(recipients, key=spare)
+        if spare(recip) < 0 or layer_allocations[donor] <= 1:
+            break
+        layer_allocations[donor] -= 1
+        layer_allocations[recip] += 1
+        logger.info(
+            f"EXO layer-cap rebalance: moved 1 layer -> node[{recip}] "
+            f"alloc={layer_allocations} max_layers={max_layers}"
+        )
+
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
         required_memory = (total_storage * node_layers) // total_layers
@@ -357,13 +386,16 @@ def find_ip_prioritised(
 
     # Ring should prioritise fastest connection. As a best-effort, we prioritise TB.
     # TODO: Profile and get actual connection speeds.
+    # EXO_CAT6_PREF: private 10.10.10.x (Mac↔Spark Cat6) must beat Wi-Fi even when
+    # the NIC is typed unknown — otherwise rank1 connects via 192.168.1.x and the
+    # ring handshake races/fails (connection refused).
     if ring:
         priority = {
             "thunderbolt": 0,
             "maybe_ethernet": 1,
             "ethernet": 2,
-            "wifi": 3,
-            "unknown": 4,
+            "unknown": 3,
+            "wifi": 4,
         }
 
     # RDMA prefers ethernet coordinator
@@ -375,7 +407,11 @@ def find_ip_prioritised(
             "maybe_ethernet": 3,
             "thunderbolt": 4,
         }
-    return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+    def _score(ip: str) -> tuple[int, int]:
+        # Prefer dedicated Cat6 / private link addresses first
+        cat6 = 0 if str(ip).startswith("10.10.10.") else 1
+        return (cat6, priority.get(ip_to_type.get(ip, "unknown"), 3))
+    return min(ips, key=_score)
 
 
 def get_mlx_ring_hosts_by_node(
