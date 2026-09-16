@@ -140,10 +140,12 @@ class PipelineFirstLayer(CustomMlxLayer):
         if self.r != 0:
             # We want to avoid GPU timeout errors by evalling the distributed operation
             # so that it stays on CPU, which does not have a timeout.
-            # Metal↔CUDA rings also need an explicit synchronize or the peer can
-            # spin forever while this side sits in Fence::wait.
-            mx.eval(x)
-            mx.synchronize()
+            # Metal↔CUDA decode: evaluating the placeholder while the peer is still
+            # in forward/send Fence::waits forever — skip when EXO_PP_SKIP_PRE_RECV_EVAL=1.
+            import os as _os
+            if _os.environ.get("EXO_PP_SKIP_PRE_RECV_EVAL", "0") != "1":
+                mx.eval(x)
+                mx.synchronize()
             print(f"[PP] recv waiting rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
             logger.info(
                 f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
