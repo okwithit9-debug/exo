@@ -25,7 +25,15 @@ Working tree patches for `orcarouter/Qwen3.8-Flash-Next-Uncensored-MLX` on Metal
 
 ## Status
 
-LoadModel with Mac rank0 / Spark rank1 works. First warmup prefill over Metal↔CUDA ring still under debug (was Fence::wait / 0% GPU spin before synchronize patch).
+LoadModel with Mac rank0 / Spark rank1 works.
+
+Proven 2026-09-16 disaggregated path (Spark prefill → Mac decode, no Mac re-prefill):
+
+- Cluster: `EXO_FAST_SYNCH=false` / `--no-fast-synch` (community Fence workaround; exo#1666)
+- `ENABLE_DISAGGREGATION=true`
+- Mac decode node: `EXO_SKIP_WARMUP=1`, `EXO_REQUIRE_REMOTE_PREFILL=1`, `EXO_REMOTE_PREFILL_MIN_TOKENS=1`
+- Link Spark prefill instance → Mac decode instance via `/v1/instance-links`
+- Decode reuses injected caches (`last_token` only). Do not set `EXO_DECODE_FULL_PROMPT`.
 
 ## Prefill / PLE notes (2026-09-15)
 
