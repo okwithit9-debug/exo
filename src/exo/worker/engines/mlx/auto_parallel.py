@@ -136,7 +136,7 @@ def _tcp_broadcast_final_hidden(
     # Earlier ranks: listen, accept one connection from last rank.
     # Brief pause so last-rank can start mx.eval while our ring threads stay
     # in SocketThread::worker rather than blocked only on accept (belt+suspenders).
-    pause = float(__import__("os").environ.get("EXO_PP_DECODE_EVAL_PAUSE", "0.05"))
+    pause = float(__import__("os").environ.get("EXO_PP_DECODE_EVAL_PAUSE", "2.0"))
     if pause > 0:
         __import__("time").sleep(pause)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -377,6 +377,12 @@ class PipelineLastLayer(CustomMlxLayer):
             f"[PP] last-layer original done rank={self.r} prefill={self.is_prefill}",
             flush=True,
         )
+        # Last-rank decode: materialize hidden before TCP so we fail loudly here
+        # (and while peer may still be in act-send / brief pause, not accept-only).
+        if (not self.is_prefill) and self.r == self.s - 1:
+            print("[PP] last-rank decode host-detach output begin", flush=True)
+            output = _host_detach_array(output)
+            print("[PP] last-rank decode host-detach output done", flush=True)
 
         if self.r != self.s - 1:
             import os as _os
@@ -419,30 +425,46 @@ class PipelineLastLayer(CustomMlxLayer):
 
 
 def detach_pipeline_kv_cache(cache) -> None:
-    """Host-copy KV entries so decode does not Fence on prefill ring edges."""
+    """Host-copy KV / SSM cache tensors so decode does not Fence on ring edges."""
     import os as _os
     if not _os.environ.get("EXO_PP_PEER_IP", "").strip():
         return
     if not cache:
         return
     print("[PP] detach_pipeline_kv_cache begin", flush=True)
+
+    def _one(a):
+        if a is None:
+            return None
+        if isinstance(a, (list, tuple)):
+            return type(a)(_one(x) for x in a)
+        if isinstance(a, dict):
+            return {k: _one(v) for k, v in a.items()}
+        # mlx array or anything np.array can materialize
+        try:
+            return _host_detach_array(a)
+        except Exception:
+            return a
+
     n = 0
     for c in cache:
-        keys = getattr(c, "keys", None)
-        values = getattr(c, "values", None)
-        if keys is None:
-            continue
-        def _one(a):
-            if a is None:
-                return None
-            if isinstance(a, (list, tuple)):
-                return type(a)(_one(x) for x in a)
-            return _host_detach_array(a)
         try:
-            c.keys = _one(keys)
-            if values is not None:
-                c.values = _one(values)
-            n += 1
+            keys = getattr(c, "keys", None)
+            values = getattr(c, "values", None)
+            if keys is not None:
+                c.keys = _one(keys)
+                if values is not None:
+                    c.values = _one(values)
+                n += 1
+            # ArraysCache / SSM / hybrid layers store ring-tied tensors in state
+            if hasattr(c, "state"):
+                try:
+                    st = c.state
+                    if st is not None:
+                        c.state = _one(st)
+                        n += 1
+                except Exception as e:
+                    print(f"[PP] detach state skip: {e}", flush=True)
         except Exception as e:
             print(f"[PP] detach_pipeline_kv_cache skip entry: {e}", flush=True)
     mx.synchronize()
