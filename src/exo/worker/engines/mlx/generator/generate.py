@@ -334,20 +334,63 @@ def prefill(
     prefill_step_size = 4096
 
     try:
-        if is_pipeline and num_tokens >= prefill_step_size:
+        # Always use queued PP sends for pipeline (including short warmup prompts).
+        # The old stream_generate path did inline send+eval and deadlocks Metal↔CUDA
+        # (rank0 Fence::wait before send, rank1 spinning in recv).
+        if is_pipeline:
             set_pipeline_queue_sends(model, queue_sends=True)
             assert group is not None, "Pipeline prefill requires a distributed group"
-            pipeline_parallel_prefill(
-                model=model,
-                prompt=prompt_tokens,
-                prompt_cache=cache,
-                prefill_step_size=prefill_step_size,
-                kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
-                prompt_progress_callback=progress_callback,
-                distributed_prompt_progress_callback=distributed_prompt_progress_callback,
-                group=group,
-            )
+            if num_tokens >= prefill_step_size:
+                pipeline_parallel_prefill(
+                    model=model,
+                    prompt=prompt_tokens,
+                    prompt_cache=cache,
+                    prefill_step_size=prefill_step_size,
+                    kv_group_size=KV_GROUP_SIZE,
+                    kv_bits=KV_BITS,
+                    prompt_progress_callback=progress_callback,
+                    distributed_prompt_progress_callback=distributed_prompt_progress_callback,
+                    group=group,
+                )
+            else:
+                # Metal↔CUDA: Qwen4 PLE does mx.eval mid-forward. If rank1 has
+                # already posted recv, those evals Fence::wait forever.
+                # Serial stages: rank0 forward+flush first, barrier, then rank1.
+                tokens = (
+                    prompt_tokens
+                    if isinstance(prompt_tokens, mx.array)
+                    else mx.array(prompt_tokens)
+                )
+                rank = group.rank()
+                print(f"[PP] short-prefill serial rank={rank} tokens={num_tokens}", flush=True)
+                logger.info(f"PP short-prefill serial rank={rank} tokens={num_tokens}")
+                if rank == 0:
+                    model(tokens[None], cache=cache)
+                    print("[PP] rank0 model done; flushing send", flush=True)
+                    flush_prefill_sends()
+                    mx.synchronize()
+                    print("[PP] rank0 flush done; barrier", flush=True)
+                mx_barrier(group)
+                if rank != 0:
+                    print("[PP] rank1 post-barrier model/recv", flush=True)
+                    model(tokens[None], cache=cache)
+                    print("[PP] rank1 model done", flush=True)
+                    flush_prefill_sends()
+                    mx.synchronize()
+                mx_barrier(group)
+                states = []
+                for c in cache:
+                    st = getattr(c, "state", None)
+                    if st is not None:
+                        states.append(st)
+                if states:
+                    mx.eval(states)
+                mx.synchronize()
+                if distributed_prompt_progress_callback is not None:
+                    distributed_prompt_progress_callback()
+                progress_callback(num_tokens, num_tokens)
+                print(f"[PP] short-prefill complete rank={rank}", flush=True)
+                logger.info(f"PP short-prefill complete rank={rank}")
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
             # We just throw away the generated token - we only care about filling the cache

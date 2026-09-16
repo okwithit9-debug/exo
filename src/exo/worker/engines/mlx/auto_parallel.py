@@ -73,10 +73,17 @@ _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
 
 
 def flush_prefill_sends() -> None:
-    for output, dst, group in _pending_prefill_sends:
+    pending = list(_pending_prefill_sends)
+    _pending_prefill_sends.clear()
+    print(f"[PP] flush_prefill_sends n={len(pending)}", flush=True)
+    logger.info(f"PP flush_prefill_sends n={len(pending)}")
+    for output, dst, group in pending:
         sent = mx.distributed.send(output, dst, group=group)
         mx.async_eval(sent)
-    _pending_prefill_sends.clear()
+        mx.eval(sent)
+    if pending:
+        mx.synchronize()
+        print("[PP] flush_prefill_sends done", flush=True)
 
 
 def clear_prefill_sends() -> None:
@@ -137,16 +144,23 @@ class PipelineFirstLayer(CustomMlxLayer):
             # spin forever while this side sits in Fence::wait.
             mx.eval(x)
             mx.synchronize()
+            print(f"[PP] recv waiting rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
             logger.info(
                 f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
             )
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
             mx.eval(x)
             mx.synchronize()
+            print(f"[PP] recv got rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
             logger.info(
                 f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
             )
-        return self.original_layer(x, *args, **kwargs)
+        else:
+            print(f"[PP] first-layer rank0 in={getattr(x, 'shape', None)}", flush=True)
+        out = self.original_layer(x, *args, **kwargs)
+        if self.r == 0:
+            print(f"[PP] first-layer rank0 original returned shape={getattr(out, 'shape', None)}", flush=True)
+        return out
 
 
 class PipelineLastLayer(CustomMlxLayer):
@@ -170,36 +184,42 @@ class PipelineLastLayer(CustomMlxLayer):
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
+        print(
+            f"[PP] last-layer enter rank={self.r}/{self.s} prefill={self.is_prefill} "
+            f"queue={self.queue_sends} in={getattr(x, 'shape', None)}",
+            flush=True,
+        )
+        logger.info(
+            f"PP last-layer enter: rank={self.r}/{self.s} prefill={self.is_prefill} "
+            f"queue={self.queue_sends} in_shape={getattr(x, 'shape', None)}"
+        )
         output: mx.array = self.original_layer(x, *args, **kwargs)
-
-        # Eval layer output to materialize it before send — this splits the graph
-        # so the send is isolated and the receiving rank's recv can complete.
-        mx.eval(output)
-        mx.synchronize()
 
         if self.r != self.s - 1:
             if self.queue_sends:
+                # Defer send+eval until flush_prefill_sends() so rank0 can finish
+                # the forward while rank1 is blocked in recv (Metal↔CUDA).
                 _pending_prefill_sends.append(
                     (output, (self.r + 1) % self.s, self.group)
                 )
+                print(f"[PP] queued send rank={self.r} pending={len(_pending_prefill_sends)}", flush=True)
             else:
                 logger.info(
                     f"PP send: rank={self.r} -> {(self.r + 1) % self.s} shape={getattr(output, 'shape', None)}"
                 )
-                output = mx.distributed.send(
+                sent = mx.distributed.send(
                     output, (self.r + 1) % self.s, group=self.group
                 )
-            if cache is not None:
-                # CacheList (used by MLA models like DeepSeekV32, GLM MoE DSA)
-                # doesn't have .keys directly; access via first sub-cache.
-                _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
-                if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
-                    _cache.keys = mx.depends(_cache.keys, output)  # type: ignore
-            mx.eval(output)
-            mx.synchronize()
-            if cache is not None and hasattr(_cache, "keys"):  # type: ignore
-                mx.eval(_cache.keys)  # type: ignore
-            logger.info(f"PP send: rank={self.r} completed")
+                mx.async_eval(sent)
+                mx.eval(sent)
+                mx.synchronize()
+                output = sent
+                logger.info(f"PP send: rank={self.r} completed")
+                if cache is not None:
+                    _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
+                    if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]
+                        _cache.keys = mx.depends(_cache.keys, output)  # type: ignore
+                        mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
             output = mx.distributed.all_gather(output, group=self.group)[
@@ -321,7 +341,34 @@ def pipeline_auto_parallel(
         pass
     total = len(layers)
     for i, layer in enumerate(layers):
-        mx.eval(layer)  # type: ignore
+        # Qwen4 PLE ShardedEmbedding is ~111GB on disk. A full mx.eval(layer)
+        # pulls every ngram shard into Metal and swap-thrashes a 128GB Mac.
+        # Leave those shards lazy; ShardedEmbedding only gathers touched rows.
+        from mlx.utils import tree_flatten
+
+        flat = dict(tree_flatten(layer.parameters()))
+        ple_shard_paths = [
+            path
+            for path in flat
+            if "ple" in path and "ngram_embedding" in path and "shards" in path
+        ]
+        if ple_shard_paths:
+            print(
+                f"[PP] load layer {i}: lazy PLE shards n={len(ple_shard_paths)}",
+                flush=True,
+            )
+            logger.info(
+                f"Skip full mx.eval for layer {i}: {len(ple_shard_paths)} PLE shard params stay lazy"
+            )
+            keep = [
+                arr
+                for path, arr in flat.items()
+                if not ("ple" in path and "ngram_embedding" in path and "shards" in path)
+            ]
+            if keep:
+                mx.eval(keep)
+        else:
+            mx.eval(layer)  # type: ignore
         mx.clear_cache()
         yield ModelLoadingResponse(layers_loaded=i, total=total)
 
@@ -332,6 +379,8 @@ def pipeline_auto_parallel(
         world_size,
         group=group,
     )
+
+
 
     if isinstance(inner_model_instance, GptOssMoeModel):
         inner_model_instance.layer_types = inner_model_instance.layer_types[
