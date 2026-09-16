@@ -237,6 +237,12 @@ def _tcp_recv_array(port: int) -> mx.array:
 
 
 def flush_prefill_sends() -> None:
+    import os as _os
+    if _os.environ.get("EXO_PP_PEER_IP", "").strip():
+        # TCP path sends inline; nothing to flush.
+        _pending_prefill_sends.clear()
+        print("[PP] flush_prefill_sends skipped (TCP mode)", flush=True)
+        return
     pending = list(_pending_prefill_sends)
     _pending_prefill_sends.clear()
     print(f"[PP] flush_prefill_sends n={len(pending)}", flush=True)
@@ -303,10 +309,11 @@ class PipelineFirstLayer(CustomMlxLayer):
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         if self.r != 0:
             import os as _os
-            # Decode: TCP activation transfer — avoids Metal↔CUDA MLX recv/detach Fence.
-            if not self.is_prefill and _os.environ.get("EXO_PP_PEER_IP", "").strip():
+            peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
+            # Metal↔CUDA: always TCP activations when peer is set (prefill + decode).
+            if peer:
                 port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
-                print(f"[PP] decode tcp-recv rank={self.r}", flush=True)
+                print(f"[PP] tcp-recv rank={self.r} prefill={self.is_prefill}", flush=True)
                 x = _tcp_recv_array(port)
                 try:
                     x = x.astype(mx.bfloat16)
@@ -316,22 +323,14 @@ class PipelineFirstLayer(CustomMlxLayer):
                     except Exception:
                         pass
             else:
-                # Prefill (or no peer env): MLX ring recv.
                 if _os.environ.get("EXO_PP_SKIP_PRE_RECV_EVAL", "0") != "1":
                     mx.eval(x)
                     mx.synchronize()
                 print(f"[PP] recv waiting rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
-                logger.info(
-                    f"PP recv: rank={self.r} waiting shape={getattr(x, 'shape', None)}"
-                )
                 x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
                 mx.eval(x)
                 mx.synchronize()
                 print(f"[PP] recv got rank={self.r} shape={getattr(x, 'shape', None)}", flush=True)
-                logger.info(
-                    f"PP recv: rank={self.r} got shape={getattr(x, 'shape', None)}"
-                )
-                # Drop ring Fence deps before Metal forward / KV writes.
                 x = _host_detach_array(x)
                 print(f"[PP] recv host-detached rank={self.r}", flush=True)
         else:
@@ -387,17 +386,16 @@ class PipelineLastLayer(CustomMlxLayer):
         if self.r != self.s - 1:
             import os as _os
             peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
-            if self.queue_sends:
-                # Prefill: defer MLX send until flush_prefill_sends().
+            if peer:
+                # Prefill + decode: TCP activations (never MLX send on Metal↔CUDA).
+                act_port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
+                print(f"[PP] tcp-send rank={self.r} prefill={self.is_prefill} -> {peer}:{act_port}", flush=True)
+                _tcp_send_array(peer, act_port, output)
+            elif self.queue_sends:
                 _pending_prefill_sends.append(
                     (output, (self.r + 1) % self.s, self.group)
                 )
                 print(f"[PP] queued send rank={self.r} pending={len(_pending_prefill_sends)}", flush=True)
-            elif (not self.is_prefill) and peer:
-                # Decode: TCP activation to next rank (no MLX send / Fence).
-                act_port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 1
-                print(f"[PP] decode tcp-send rank={self.r} -> {peer}:{act_port}", flush=True)
-                _tcp_send_array(peer, act_port, output)
             else:
                 logger.info(
                     f"PP send: rank={self.r} -> {(self.r + 1) % self.s} shape={getattr(output, 'shape', None)}"

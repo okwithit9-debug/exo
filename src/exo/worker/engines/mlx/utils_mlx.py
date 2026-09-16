@@ -832,13 +832,52 @@ def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
 
 
 def mx_barrier(group: mx.distributed.Group | None):
+    """Sync ranks. Prefer TCP when EXO_PP_PEER_IP is set (Metal↔CUDA safe)."""
     if group is None:
+        return
+    import os as _os
+    peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
+    if peer:
+        import socket
+        import struct
+        import time as _time
+        port = int(_os.environ.get("EXO_PP_SYNC_PORT", "52416")) + 2
+        rank = group.rank()
+        if rank == 0:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0", port))
+            srv.listen(8)
+            srv.settimeout(120.0)
+            # world_size-1 accepts
+            for _ in range(max(group.size() - 1, 1)):
+                conn, _addr = srv.accept()
+                with conn:
+                    conn.recv(1)
+                    conn.sendall(b"x")
+            srv.close()
+        else:
+            deadline = _time.time() + 120
+            last = None
+            while _time.time() < deadline:
+                try:
+                    with socket.create_connection((peer, port), timeout=2.0) as sock:
+                        sock.sendall(b"x")
+                        sock.recv(1)
+                    last = None
+                    break
+                except OSError as e:
+                    last = e
+                    _time.sleep(0.05)
+            if last is not None:
+                raise last
         return
     mx.eval(
         mx.distributed.all_sum(
             mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
         )
     )
+
 
 
 def _parse_kimi_tool_calls(text: str):

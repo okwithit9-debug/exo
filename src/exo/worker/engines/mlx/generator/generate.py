@@ -354,36 +354,62 @@ def prefill(
                     group=group,
                 )
             else:
-                # Metal↔CUDA: Qwen4 PLE does mx.eval mid-forward. If rank1 has
-                # already posted recv, those evals Fence::wait forever.
-                # Serial: rank0 completes forward (queues send) before barrier.
-                # Flush AFTER barrier, concurrent with rank1 recv — flushing
-                # before barrier deadlocks because mx.distributed.send/eval
-                # waits for the peer recv that rank1 only posts post-barrier.
+                # Metal↔CUDA: use TCP activations (see auto_parallel). Both ranks
+                # must call model() together so rank1 can accept while rank0 sends.
+                import os as _os
                 tokens = (
                     prompt_tokens
                     if isinstance(prompt_tokens, mx.array)
                     else mx.array(prompt_tokens)
                 )
                 rank = group.rank()
-                print(f"[PP] short-prefill serial rank={rank} tokens={num_tokens}", flush=True)
-                logger.info(f"PP short-prefill serial rank={rank} tokens={num_tokens}")
-                if rank == 0:
-                    model(tokens[None], cache=cache)
+                peer = _os.environ.get("EXO_PP_PEER_IP", "").strip()
+                print(f"[PP] short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}", flush=True)
+                logger.info(f"PP short-prefill rank={rank} tokens={num_tokens} tcp={bool(peer)}")
+
+                def _step(tok):
+                    mx_barrier(group)
+                    model(tok[None], cache=cache)
                     mx.synchronize()
-                    print("[PP] rank0 model done; barrier then flush", flush=True)
-                mx_barrier(group)
-                if rank == 0:
-                    print("[PP] rank0 post-barrier flush", flush=True)
                     flush_prefill_sends()
-                    mx.synchronize()
+                    mx_barrier(group)
+
+                if peer:
+                    _step(tokens)
+                    progress_callback(num_tokens, num_tokens)
+                    for step in range(2):
+                        print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
+                        _step(tokens[-1:])
                 else:
-                    print("[PP] rank1 post-barrier model/recv", flush=True)
-                    model(tokens[None], cache=cache)
-                    print("[PP] rank1 model done", flush=True)
-                    flush_prefill_sends()
-                    mx.synchronize()
-                mx_barrier(group)
+                    # Homogeneous MLX ring: keep serial queue/flush path.
+                    if rank == 0:
+                        model(tokens[None], cache=cache)
+                        mx.synchronize()
+                    mx_barrier(group)
+                    if rank == 0:
+                        flush_prefill_sends()
+                        mx.synchronize()
+                    else:
+                        model(tokens[None], cache=cache)
+                        flush_prefill_sends()
+                        mx.synchronize()
+                    mx_barrier(group)
+                    progress_callback(num_tokens, num_tokens)
+                    for step in range(2):
+                        print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
+                        if rank == 0:
+                            model(tokens[-1:][None], cache=cache)
+                            mx.synchronize()
+                        mx_barrier(group)
+                        if rank == 0:
+                            flush_prefill_sends()
+                            mx.synchronize()
+                        else:
+                            model(tokens[-1:][None], cache=cache)
+                            flush_prefill_sends()
+                            mx.synchronize()
+                        mx_barrier(group)
+
                 states = []
                 for c in cache:
                     st = getattr(c, "state", None)
@@ -394,25 +420,6 @@ def prefill(
                 mx.synchronize()
                 if distributed_prompt_progress_callback is not None:
                     distributed_prompt_progress_callback()
-                # Snapshot once at true prompt length (before +2 overhang).
-                progress_callback(num_tokens, num_tokens)
-                # Match pipeline_parallel_prefill / stream_generate: process
-                # prompt[-1:] twice so shared trim(2) + last_token=prompt[-2:]
-                # decode path stays consistent (avoids inline-send decode deadlock).
-                for step in range(2):
-                    print(f"[PP] short-prefill overhang step={step} rank={rank}", flush=True)
-                    if rank == 0:
-                        model(tokens[-1:][None], cache=cache)
-                        mx.synchronize()
-                    mx_barrier(group)
-                    if rank == 0:
-                        flush_prefill_sends()
-                        mx.synchronize()
-                    else:
-                        model(tokens[-1:][None], cache=cache)
-                        flush_prefill_sends()
-                        mx.synchronize()
-                    mx_barrier(group)
                 print(f"[PP] short-prefill complete rank={rank}", flush=True)
                 logger.info(f"PP short-prefill complete rank={rank}")
                 # Fall through to shared trim(2). For SSM, snapshots[-2] needs
