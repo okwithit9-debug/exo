@@ -233,23 +233,35 @@ class PipelineLastLayer(CustomMlxLayer):
                         mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            # Metal↔CUDA: if rank0 enters all_gather while rank1 is still in
-            # Metal forward, rank1 Fence::waits forever. Barrier first so both
-            # finish local send/forward, then gather.
-            print(
-                f"[PP] decode pre-all_gather barrier rank={self.r}/{self.s}",
-                flush=True,
-            )
-            logger.info(
-                f"PP decode pre-all_gather barrier rank={self.r}/{self.s}"
-            )
-            mx.synchronize()
-            _pp_barrier(self.group)
-            output = mx.distributed.all_gather(output, group=self.group)[
-                -output.shape[0] :
-            ]
-            mx.eval(output)
-            mx.synchronize()
+            # Metal↔CUDA: all_gather during decode deadlocks (rank0 in gather
+            # while rank1 still in Metal forward, or gather itself hangs).
+            # Same effect as all_gather+take-last: last rank broadcasts its
+            # final hidden to earlier ranks via send/recv (works on this ring).
+            if self.r == self.s - 1:
+                for dst in range(self.s - 1):
+                    print(
+                        f"[PP] decode broadcast send {self.r}->{dst} shape={getattr(output, 'shape', None)}",
+                        flush=True,
+                    )
+                    logger.info(
+                        f"PP decode broadcast send {self.r}->{dst} shape={getattr(output, 'shape', None)}"
+                    )
+                    sent = mx.distributed.send(output, dst, group=self.group)
+                    mx.async_eval(sent)
+                    mx.eval(sent)
+                mx.synchronize()
+            else:
+                src = self.s - 1
+                print(
+                    f"[PP] decode broadcast recv {self.r}<-{src} shape={getattr(output, 'shape', None)}",
+                    flush=True,
+                )
+                logger.info(
+                    f"PP decode broadcast recv {self.r}<-{src} shape={getattr(output, 'shape', None)}"
+                )
+                output = mx.distributed.recv_like(output, src, group=self.group)
+                mx.eval(output)
+                mx.synchronize()
 
         return output
 
